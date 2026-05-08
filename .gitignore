@@ -1,0 +1,35 @@
+# Deny all
+/*
+
+# Allow project files
+!.gitignore
+!LICENSE
+!Makefile
+!Dockerfile
+!docker-compose.yml
+!haproxy.cfg
+!info.json
+!autoresearch.sh
+!README.md
+
+# Allow source code
+!src/
+!src/*.c
+!src/*.h
+
+# Allow resources (reference data, but not the huge index.bin)
+!resources/
+!resources/mcc_risk.json
+!resources/references.json.gz
+!resources/example-payloads.json
+!resources/example-references.json
+resources/index.bin
+
+# Allow data (only compressed index)
+!data/
+!data/*.bin.gz
+data/*.bin
+
+# Allow CI
+!.github/
+!.github/**/*
