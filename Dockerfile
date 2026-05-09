@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 debian:trixie-slim AS build
+FROM debian:trixie-slim AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc make libc6-dev gzip && rm -rf /var/lib/apt/lists/*
@@ -9,7 +9,7 @@ COPY src/ src/
 COPY resources/ resources/
 COPY data/index.bin.gz ./data/
 
-RUN gunzip -k data/index.bin.gz && make && mkdir -p /app && cp rinha-server /app/server
+RUN gzip -dk data/index.bin.gz && make && mkdir -p /app && cp rinha-server /app/server
 
 FROM scratch
 COPY --from=build /app/server /app/server
