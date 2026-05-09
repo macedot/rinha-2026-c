@@ -64,9 +64,9 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta para servir
                            └─────┬────┘
                                  │ HTTP :9999
                           ┌──────▼────────┐
-                          │  HAProxy 3.3  │
+                          │    passa      │
                           │  cpus: 0.2    │
-                          │  mem:  30 MB  │
+                          │  mem:  50 MB  │
                           └───┬───────┬───┘
                               │       │
                      UDS /sockets/    UDS /sockets/
@@ -94,7 +94,7 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta para servir
                    └─────────────┘ └─────────────┘
 
     ┌──────────────────────────────────────────────────────┐
-    │  rinha-sockets (tmpfs, 10mb)  ·  rede bridge         │
+    │  rinha-c-sockets (tmpfs, 10mb)  ·  rede bridge         │
     │  CPU total: 1.0   |   Memória total: 350 MB          │
     └──────────────────────────────────────────────────────┘
 ```
@@ -102,7 +102,7 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta para servir
 ### Fluxo da requisição
 
 1. **Cliente** envia `POST /fraud-score` com JSON da transação para a porta `9999`
-2. **HAProxy** faz round-robin do payload HTTP bruto sobre **Unix Domain Sockets** (`/sockets/api1.sock` ou `api2.sock`) — zero overhead de TCP, sem inspeção de payload
+2. **passa** faz round-robin do payload HTTP bruto sobre **Unix Domain Sockets** (`/sockets/api1.sock` ou `api2.sock`) — zero overhead de TCP, sem inspeção de payload
 3. **Servidor POSIX** faz o parse da requisição HTTP em um buffer de 32KB na pilha — sem alocação no heap
 4. **Vetorizador** transforma o payload JSON em um vetor float de 14 dimensões usando as fórmulas oficiais de normalização
 5. **Busca IVF C/AVX2** quantiza para `int16`, calcula distâncias dos centroides com AVX2+FMA, seleciona top-N clusters e varre blocos AoSoA com AVX2 FMA + early termination + prefetch. Retorna k=5 vizinhos mais próximos via busca em dois estágios (passada rápida → passada completa para resultados ambíguos)
@@ -112,7 +112,7 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta para servir
 
 | Componente | Linguagem | Função |
 |-----------|----------|------|
-| **HAProxy 3.3** | C | Balanceador de carga layer 7, round-robin sobre UDS |
+| **passa** | Rust | Balanceador de carga layer 7, round-robin sobre UDS |
 | **Servidor POSIX** | C | Parse HTTP em buffer de pilha, listener UDS |
 | **Vetorizador** | C | Vetorizador de features 14-dim seguindo regras oficiais de normalização |
 | **Parser JSON** | C | Parser JSON customizado sem alocação |
@@ -121,13 +121,13 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta para servir
 
 ### Transporte
 
-O HAProxy se comunica com as instâncias da API via **Unix Domain Sockets** em um volume `tmpfs` (`rinha-sockets`). Isso elimina completamente o overhead de TCP — sem pilha de rede do kernel, sem buffers de socket, sem filas de accept. Um único volume tmpfs de 10 MB comporta ambos os arquivos de socket da API.
+O passa se comunica com as instâncias da API via **Unix Domain Sockets** em um volume `tmpfs` (`rinha-c-sockets`). Isso elimina completamente o overhead de TCP — sem pilha de rede do kernel, sem buffers de socket, sem filas de accept. Um único volume tmpfs de 10 MB comporta ambos os arquivos de socket da API.
 
 ### Stack Tecnológico
 
 - **C11** — POSIX sockets, parser JSON sem alocação, servidor HTTP com buffer de pilha
 - **AVX2+FMA** — intrínsecos otimizados à mão para distância de centroides, seleção top-N, varredura de blocos AoSoA com prefetch e early termination
-- **HAProxy 3.3** — balanceador de carga stateless round-robin
+- **passa** — balanceador de carga stateless round-robin
 - **Docker Compose** — 3 serviços, rede bridge, limites de recursos via `deploy.resources.limits`
 
 ## Destaques de Otimização
@@ -143,7 +143,7 @@ O kernel de busca IVF passou por micro-otimizações extensivas visando latênci
 | **Reordenação de clusters** | Varre primeiro os clusters menores para apertar a pior distância mais cedo |
 | **Centroides transpostos** | Layout column-major dos centroides para cargas AVX2 cache-friendly |
 | **Zero alocação** | Todo parsing em buffers de pilha, respostas HTTP pré-computadas |
-| **Transporte UDS** | HAProxy ↔ API via Unix domain sockets (zero overhead de TCP) |
+| **Transporte UDS** | passa ↔ API via Unix domain sockets (zero overhead de TCP) |
 
 ## Configuração
 
@@ -175,7 +175,7 @@ Todas as constantes de normalização seguem o `normalization.json` oficial.
 │   └── index.bin.gz        # Índice IVF pré-construído (3M vetores, 4096 clusters, ~30MB comprimido)
 ├── Dockerfile              # Multi-estágio: build gcc → runtime Debian slim
 ├── docker-compose.yml      # Deploy de 3 serviços com limites de recursos
-├── haproxy.cfg             # Configuração de UDS round-robin do HAProxy
+├── haproxy.cfg             # Configuração legada de UDS round-robin do HAProxy
 ├── Makefile                # Build: gcc -O3 -mavx2 -mfma
 ├── .github/workflows/release.yml  # CI: build & push da imagem Docker para GHCR
 ├── LICENSE                 # MIT
@@ -183,7 +183,7 @@ Todas as constantes de normalização seguem o `normalization.json` oficial.
 └── README.md
 ```
 
-> O branch `submission` contém apenas `docker-compose.yml`, `haproxy.cfg` e `info.json` — sem código fonte. Ele referencia a imagem pré-compilada `ghcr.io/macedot/rinha-2026-c:latest`.
+> O branch `submission` contém apenas `docker-compose.yml` e `info.json` — sem código fonte. Ele referencia a imagem pré-compilada `ghcr.io/macedot/rinha-2026-c:latest`.
 
 ## CI/CD
 
