@@ -1,7 +1,5 @@
 x-api-common: &api-common
   build: .
-  volumes:
-    - rinha-c-sockets:/sockets
   networks:
     - rinha-c-net
   ulimits:
@@ -13,64 +11,50 @@ x-api-common: &api-common
       limits:
         cpus: "0.4"
         memory: "160M"
-  environment: &api-env
-    INDEX_PATH: "/app/resources/index.bin"
-    LISTEN_TCP: "0"
-    UDS_MODE: "666"
-    UNLINK_UDS: "1"
-    IVF_NPROBE: "8"
-    IVF_FULL_NPROBE: "24"
-    CANDIDATES: "0"
 
 services:
-  passa:
-    image: ghcr.io/macedot/passa:latest
-    container_name: rinha-c-passa
+  nginx:
+    image: nginx:alpine
+    container_name: rinha-c-nginx
     ports:
       - "9999:9999"
     volumes:
-      - rinha-c-sockets:/sockets
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - api1
       - api2
     networks:
       - rinha-c-net
-    security_opt:
-      - seccomp:unconfined
     deploy:
       resources:
         limits:
           cpus: "0.2"
           memory: "50M"
-    environment:
-      PORT: "9999"
-      BUF_SIZE: "4096"
-      UPSTREAMS: "/sockets/api1.sock,/sockets/api2.sock"
 
   api1:
     <<: *api-common
     container_name: rinha-c-api1
     hostname: api1
     environment:
-      <<: *api-env
-      UDS_PATH: "/sockets/api1.sock"
+      INDEX_PATH: "/app/resources/index.bin"
+      LISTEN_TCP: "1"
+      PORT: "8080"
+      IVF_NPROBE: "8"
+      IVF_FULL_NPROBE: "24"
+      CANDIDATES: "0"
 
   api2:
     <<: *api-common
     container_name: rinha-c-api2
     hostname: api2
     environment:
-      <<: *api-env
-      UDS_PATH: "/sockets/api2.sock"
+      INDEX_PATH: "/app/resources/index.bin"
+      LISTEN_TCP: "1"
+      PORT: "8080"
+      IVF_NPROBE: "8"
+      IVF_FULL_NPROBE: "24"
+      CANDIDATES: "0"
 
 networks:
   rinha-c-net:
     driver: bridge
-
-volumes:
-  rinha-c-sockets:
-    driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: size=10m
