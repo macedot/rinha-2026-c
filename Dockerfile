@@ -11,7 +11,7 @@ COPY resources/ resources/
 
 RUN mkdir -p data && gzip -dkc bridge/data/index.bin.gz > data/index.bin && make && mkdir -p /app && cp rinha-server /app/server
 
-FROM scratch
+FROM debian:trixie-slim
 COPY --from=build /app/server /app/server
 COPY --from=build /src/data/index.bin /app/resources/index.bin
 
