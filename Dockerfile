@@ -8,9 +8,8 @@ COPY Makefile Makefile
 COPY src/ src/
 COPY bridge/ bridge/
 COPY resources/ resources/
-COPY data/index.bin.gz ./data/
 
-RUN gzip -dk data/index.bin.gz && make && mkdir -p /app && cp rinha-server /app/server
+RUN mkdir -p data && gzip -dkc bridge/data/index.bin.gz > data/index.bin && make && mkdir -p /app && cp rinha-server /app/server
 
 FROM scratch
 COPY --from=build /app/server /app/server
