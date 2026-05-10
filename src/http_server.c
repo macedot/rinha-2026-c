@@ -15,8 +15,21 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #define REQ_BUF_SIZE 32768
+
+static uint64_t g_time_read_total = 0;
+static uint64_t g_time_vectorize_total = 0;
+static uint64_t g_time_search_total = 0;
+static uint64_t g_time_write_total = 0;
+static uint64_t g_req_count = 0;
+
+static inline uint64_t hr_nanos(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static int write_all(int fd, const char *data, size_t len) {
     size_t sent = 0;
@@ -84,6 +97,40 @@ static void handle_connection(int fd) {
             return;
         }
 
+        if (memcmp(req_buf, "GET /inst", 9) == 0) {
+            uint64_t inst[7];
+            rinha_get_inst(inst);
+            char ibuf[1024];
+            int ilen = snprintf(ibuf, sizeof(ibuf),
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
+                "=== Pipeline (avg ns/req, %llu reqs) ===\n"
+                "read:       %llu\n"
+                "vectorize:  %llu\n"
+                "search:     %llu\n"
+                "write:      %llu\n"
+                "\n=== Search breakdown (avg ns/search, %llu searches) ===\n"
+                "quantize:   %llu\n"
+                "centroids:  %llu\n"
+                "topn:       %llu\n"
+                "reorder:    %llu\n"
+                "fast_scan:  %llu\n"
+                "full_scan:  %llu\n",
+                (unsigned long long)g_req_count,
+                (unsigned long long)(g_req_count ? g_time_read_total / g_req_count : 0),
+                (unsigned long long)(g_req_count ? g_time_vectorize_total / g_req_count : 0),
+                (unsigned long long)(g_req_count ? g_time_search_total / g_req_count : 0),
+                (unsigned long long)(g_req_count ? g_time_write_total / g_req_count : 0),
+                (unsigned long long)inst[6],
+                (unsigned long long)(inst[6] ? inst[0] / inst[6] : 0),
+                (unsigned long long)(inst[6] ? inst[1] / inst[6] : 0),
+                (unsigned long long)(inst[6] ? inst[2] / inst[6] : 0),
+                (unsigned long long)(inst[6] ? inst[3] / inst[6] : 0),
+                (unsigned long long)(inst[6] ? inst[4] / inst[6] : 0),
+                (unsigned long long)(inst[6] ? inst[5] / inst[6] : 0));
+            write_all(fd, ibuf, (size_t)ilen);
+            return;
+        }
+
         if (memcmp(req_buf, "POST /fraud-score", 17) == 0) {
             size_t cl = find_content_length(req_buf, header_len);
             if (cl == (size_t)-1) {
@@ -96,19 +143,27 @@ static void handle_connection(int fd) {
                 continue;
             }
 
+            g_req_count++;
+
+            uint64_t t_vec = hr_nanos();
             float q[VEC_DIM];
             if (!vectorizer_build(req_buf + body_start, cl, q)) {
                 write_all(fd, resp_bad_req, strlen(resp_bad_req));
                 return;
             }
+            g_time_vectorize_total += hr_nanos() - t_vec;
 
+            uint64_t t_search = hr_nanos();
             int frauds = rinha_search(q);
+            g_time_search_total += hr_nanos() - t_search;
             if (frauds > 5) {
                 write_all(fd, resp_internal_err, strlen(resp_internal_err));
                 return;
             }
             const char *resp = score_for((uint8_t)frauds);
+            uint64_t t_write = hr_nanos();
             write_all(fd, resp, strlen(resp));
+            g_time_write_total += hr_nanos() - t_write;
             return;
         }
 
