@@ -21,6 +21,12 @@ x-api-common: &api-common
     IVF_NPROBE: "8"
     IVF_FULL_NPROBE: "24"
     CANDIDATES: "0"
+  healthcheck:
+    test: ["CMD-SHELL", "test -S $$UDS_PATH"]
+    interval: 1s
+    timeout: 1s
+    retries: 30
+    start_period: 5s
 
 services:
   passa:
@@ -31,8 +37,10 @@ services:
     volumes:
       - rinha-c-sockets:/sockets
     depends_on:
-      - api1
-      - api2
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
     networks:
       - rinha-c-net
     security_opt:
