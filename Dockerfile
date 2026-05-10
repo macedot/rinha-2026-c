@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY Makefile Makefile
 COPY src/ src/
+COPY bridge/ bridge/
 COPY resources/ resources/
 COPY data/index.bin.gz ./data/
 
