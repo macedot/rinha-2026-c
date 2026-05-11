@@ -12,7 +12,7 @@ x-api-common: &api-common
     resources:
       limits:
         cpus: "0.4"
-        memory: "160M"
+        memory: "150M"
   environment: &api-env
     INDEX_PATH: "/app/resources/index.bin"
     LISTEN_TCP: "0"
