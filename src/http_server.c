@@ -6,9 +6,6 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -184,33 +181,6 @@ static uint32_t octal_from_decimal(uint32_t mode) {
     return (aa << 6) | (bb << 3) | cc;
 }
 
-static int create_tcp_socket(const config_t *cfg) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    if (cfg->reuse_port)
-        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-    if (cfg->tcp_nodelay)
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(cfg->port);
-    if (strcmp(cfg->host, "0.0.0.0") == 0)
-        addr.sin_addr.s_addr = INADDR_ANY;
-    else
-        inet_aton(cfg->host, &addr.sin_addr);
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { close(fd); return -1; }
-    if (listen(fd, 1024) != 0) { close(fd); return -1; }
-
-    fprintf(stderr, "listening TCP %s:%d\n", cfg->host, cfg->port);
-    return fd;
-}
-
 static int create_uds_socket(const config_t *cfg) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -236,11 +206,7 @@ static int create_uds_socket(const config_t *cfg) {
 }
 
 int server_run(const config_t *cfg) {
-    int server_fd;
-    if (cfg->use_tcp)
-        server_fd = create_tcp_socket(cfg);
-    else
-        server_fd = create_uds_socket(cfg);
+    int server_fd = create_uds_socket(cfg);
 
     if (server_fd < 0) {
         fprintf(stderr, "failed to create socket\n");
@@ -295,10 +261,6 @@ int server_run(const config_t *cfg) {
                         close(client_fd);
                         continue;
                     }
-
-                    /* TCP_NODELAY for low-latency responses */
-                    int opt = 1;
-                    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
                     struct epoll_event cev;
                     cev.events = EPOLLIN | EPOLLET;
