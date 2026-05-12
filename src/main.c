@@ -9,7 +9,6 @@
 #include <sched.h>
 #include <unistd.h>
 #include <string.h>
-
 static void maybe_pin_cpu(const config_t *cfg) {
     cpu_set_t avail;
     CPU_ZERO(&avail);
