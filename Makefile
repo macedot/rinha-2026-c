@@ -4,7 +4,7 @@ CFLAGS = -O3 -march=haswell -mtune=haswell -flto -fomit-frame-pointer -fno-plt \
          -DNDEBUG -Wall -Wextra -Ibridge
 LDFLAGS = -static -flto -s -lm
 
-SRCS = src/main.c src/config.c bridge/bridge.c src/http_server.c src/http_resp.c src/vectorizer.c
+SRCS = src/main.c src/config.c bridge/bridge.c src/http_server.c src/http_resp.c src/vectorizer.c src/scm_rights.c
 TARGET = rinha-server
 
 all: $(TARGET)
