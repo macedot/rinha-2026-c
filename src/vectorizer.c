@@ -31,191 +31,102 @@ static float mcc_risk_f(unsigned mcc) {
     }
 }
 
-/* --- JSON helpers (zero-allocation) --- */
+/* --- Single-pass JSON parser (no backtracking) --- */
 
-static size_t skip_ws(const char *p, size_t len, size_t pos) {
-    while (pos < len && (p[pos] == ' ' || p[pos] == '\n' || p[pos] == '\r' || p[pos] == '\t'))
-        pos++;
-    return pos;
+typedef struct {
+    const char *s;
+    size_t len;
+    size_t pos;
+} parser_t;
+
+static inline void skip_ws(parser_t *p) {
+    while (p->pos < p->len && (p->s[p->pos] == ' ' || p->s[p->pos] == '\n' ||
+                               p->s[p->pos] == '\r' || p->s[p->pos] == '\t'))
+        p->pos++;
 }
 
-static int find_str(const char *data, size_t data_len, size_t start,
-                    const char *needle, size_t needle_len, size_t *out_pos) {
-    for (size_t i = start; i + needle_len <= data_len; i++) {
-        if (data[i] == needle[0] && memcmp(data + i, needle, needle_len) == 0) {
-            if (out_pos) *out_pos = i;
-            return 1;
+static inline void expect_char(parser_t *p, char c) {
+    skip_ws(p);
+    if (p->pos < p->len && p->s[p->pos] == c) p->pos++;
+}
+
+static inline void skip_string(parser_t *p) {
+    skip_ws(p);
+    if (p->pos < p->len && p->s[p->pos] == '"') {
+        p->pos++;
+        while (p->pos < p->len && p->s[p->pos] != '"') p->pos++;
+        if (p->pos < p->len) p->pos++;
+    }
+}
+
+static inline float parse_f32(parser_t *p) {
+    skip_ws(p);
+    int neg = 0;
+    if (p->pos < p->len && p->s[p->pos] == '-') { neg = 1; p->pos++; }
+    unsigned int_part = 0;
+    while (p->pos < p->len && p->s[p->pos] >= '0' && p->s[p->pos] <= '9') {
+        int_part = int_part * 10 + (unsigned)(p->s[p->pos] - '0');
+        p->pos++;
+    }
+    float v = (float)int_part;
+    if (p->pos < p->len && p->s[p->pos] == '.') {
+        p->pos++;
+        unsigned frac = 0, frac_digits = 0;
+        while (p->pos < p->len && p->s[p->pos] >= '0' && p->s[p->pos] <= '9' && frac_digits < 6) {
+            frac = frac * 10 + (unsigned)(p->s[p->pos] - '0');
+            frac_digits++;
+            p->pos++;
         }
+        if (frac_digits > 0) {
+            static const float POW10_NEG[7] = {
+                1.0f, 0.1f, 0.01f, 0.001f, 0.0001f, 0.00001f, 0.000001f
+            };
+            v += (float)frac * POW10_NEG[frac_digits];
+        }
+        while (p->pos < p->len && p->s[p->pos] >= '0' && p->s[p->pos] <= '9') p->pos++;
+    }
+    return neg ? -v : v;
+}
+
+static inline int parse_bool(parser_t *p) {
+    skip_ws(p);
+    if (p->pos + 4 <= p->len && memcmp(p->s + p->pos, "true", 4) == 0) {
+        p->pos += 4; return 1;
+    }
+    if (p->pos + 5 <= p->len && memcmp(p->s + p->pos, "false", 5) == 0) {
+        p->pos += 5; return 0;
     }
     return 0;
 }
 
-static size_t matching_brace(const char *open, size_t len) {
-    if (len == 0 || open[0] != '{') return 0;
-    size_t depth = 0;
-    int in_str = 0, esc = 0;
-    for (size_t i = 0; i < len; i++) {
-        if (in_str) {
-            if (esc) { esc = 0; continue; }
-            if (open[i] == '\\') { esc = 1; continue; }
-            if (open[i] == '"') { in_str = 0; continue; }
-            continue;
-        }
-        if (open[i] == '"') { in_str = 1; continue; }
-        if (open[i] == '{') { depth++; continue; }
-        if (open[i] == '}') {
-            depth--;
-            if (depth == 0) return i + 1;
-        }
+static inline void parse_string_bounds(parser_t *p, const char **start, size_t *len) {
+    skip_ws(p);
+    *start = NULL; *len = 0;
+    if (p->pos < p->len && p->s[p->pos] == '"') {
+        p->pos++;
+        *start = p->s + p->pos;
+        while (p->pos < p->len && p->s[p->pos] != '"') p->pos++;
+        *len = (size_t)(p->s + p->pos - *start);
+        if (p->pos < p->len) p->pos++;
     }
-    return 0;
 }
 
-static int object_range(const char *data, size_t data_len, const char *key,
-                        size_t *out_start, size_t *out_len) {
-    char pat[128];
-    int pat_len = snprintf(pat, sizeof(pat), "\"%s\"", key);
-    size_t pos;
-    if (!find_str(data, data_len, 0, pat, (size_t)pat_len, &pos)) return 0;
-
-    /* find colon */
-    size_t ci = pos + (size_t)pat_len;
-    while (ci < data_len && data[ci] != ':') ci++;
-    if (ci >= data_len) return 0;
-    ci++;
-
-    size_t p = skip_ws(data, data_len, ci);
-    if (p >= data_len || data[p] != '{') return 0;
-    size_t close = matching_brace(data + p, data_len - p);
-    if (close == 0) return 0;
-    *out_start = p;
-    *out_len = close;
-    return 1;
-}
-
-static int json_number(const char *data, size_t data_len, const char *key, float *out) {
-    char pat[128];
-    int pat_len = snprintf(pat, sizeof(pat), "\"%s\"", key);
-    size_t pos;
-    if (!find_str(data, data_len, 0, pat, (size_t)pat_len, &pos)) return 0;
-
-    size_t ci = pos + (size_t)pat_len;
-    while (ci < data_len && data[ci] != ':') ci++;
-    if (ci >= data_len) return 0;
-    ci++;
-    ci = skip_ws(data, data_len, ci);
-    if (ci >= data_len) return 0;
-
-    size_t end = ci;
-    while (end < data_len && (isdigit((unsigned char)data[end]) || data[end] == '-' || data[end] == '+' || data[end] == '.'))
-        end++;
-    if (end == ci) return 0;
-
-    char buf[64];
-    size_t num_len = end - ci;
-    if (num_len >= sizeof(buf)) return 0;
-    memcpy(buf, data + ci, num_len);
-    buf[num_len] = '\0';
-    *out = strtof(buf, NULL);
-    return 1;
-}
-
-static int json_bool(const char *data, size_t data_len, const char *key, int *out) {
-    char pat[128];
-    int pat_len = snprintf(pat, sizeof(pat), "\"%s\"", key);
-    size_t pos;
-    if (!find_str(data, data_len, 0, pat, (size_t)pat_len, &pos)) return 0;
-
-    size_t ci = pos + (size_t)pat_len;
-    while (ci < data_len && data[ci] != ':') ci++;
-    if (ci >= data_len) return 0;
-    ci++;
-    ci = skip_ws(data, data_len, ci);
-    if (ci + 4 <= data_len && memcmp(data + ci, "true", 4) == 0) { *out = 1; return 1; }
-    if (ci + 5 <= data_len && memcmp(data + ci, "false", 5) == 0) { *out = 0; return 1; }
-    return 0;
-}
-
-static int json_string(const char *data, size_t data_len, const char *key,
-                       size_t *out_start, size_t *out_len) {
-    char pat[128];
-    int pat_len = snprintf(pat, sizeof(pat), "\"%s\"", key);
-    size_t pos;
-    if (!find_str(data, data_len, 0, pat, (size_t)pat_len, &pos)) return 0;
-
-    size_t ci = pos + (size_t)pat_len;
-    while (ci < data_len && data[ci] != ':') ci++;
-    if (ci >= data_len) return 0;
-    ci++;
-    ci = skip_ws(data, data_len, ci);
-    if (ci >= data_len || data[ci] != '"') return 0;
-    ci++;
-    size_t start = ci;
-    while (ci < data_len && data[ci] != '"') ci++;
-    if (ci >= data_len) return 0;
-    *out_start = start;
-    *out_len = ci - start;
-    return 1;
-}
-
-static int array_contains_string(const char *data, size_t data_len, const char *key,
-                                 const char *needle, size_t needle_len) {
-    char pat[128];
-    int pat_len = snprintf(pat, sizeof(pat), "\"%s\"", key);
-    size_t pos;
-    if (!find_str(data, data_len, 0, pat, (size_t)pat_len, &pos)) return 0;
-
-    size_t ci = pos + (size_t)pat_len;
-    while (ci < data_len && data[ci] != '[') ci++;
-    if (ci >= data_len) return 0;
-    ci++;
-
-    while (ci < data_len) {
-        ci = skip_ws(data, data_len, ci);
-        if (ci >= data_len || data[ci] == ']') break;
-        if (data[ci] == '"') {
-            ci++;
-            size_t s_start = ci;
-            while (ci < data_len && data[ci] != '"') ci++;
-            size_t s_len = ci - s_start;
-            if (s_len == needle_len && memcmp(data + s_start, needle, needle_len) == 0)
-                return 1;
-            if (ci < data_len) ci++; /* skip closing quote */
-        } else {
-            while (ci < data_len && data[ci] != ',' && data[ci] != ']') ci++;
-        }
-        if (ci < data_len && data[ci] == ',') ci++;
-    }
-    return 0;
-}
-
-/* --- ISO 8601 date helpers --- */
-
-static unsigned iso_hour_utc(const char *s, size_t len) {
-    if (len < 14) return 0;
+static inline unsigned iso_hour(const char *s, size_t len) {
+    if (len < 13) return 0;
     unsigned h = (unsigned)(s[11] - '0') * 10 + (unsigned)(s[12] - '0');
     return h > 23 ? 23 : h;
 }
 
-static unsigned iso_minute(const char *s, size_t len) {
-    if (len < 16) return 0;
-    return (unsigned)(s[14] - '0') * 10 + (unsigned)(s[15] - '0');
-}
-
-static int iso_year(const char *s, size_t len) {
-    if (len < 4) return 0;
-    return (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
-}
-
-static unsigned iso_month(const char *s, size_t len) {
-    if (len < 7) return 1;
-    unsigned m = (unsigned)(s[5] - '0') * 10 + (unsigned)(s[6] - '0');
-    return (m < 1 || m > 12) ? 1 : m;
-}
-
-static unsigned iso_day(const char *s, size_t len) {
-    if (len < 10) return 1;
-    return (unsigned)(s[8] - '0') * 10 + (unsigned)(s[9] - '0');
+static inline void iso_ymdhm(const char *s, size_t len,
+                             int *y, unsigned *m, unsigned *d,
+                             unsigned *h, unsigned *mi) {
+    *y = 0; *m = 1; *d = 1; *h = 0; *mi = 0;
+    if (len < 16) return;
+    *y = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+    *m = (unsigned)(s[5]-'0')*10 + (unsigned)(s[6]-'0');
+    *d = (unsigned)(s[8]-'0')*10 + (unsigned)(s[9]-'0');
+    *h = (unsigned)(s[11]-'0')*10 + (unsigned)(s[12]-'0');
+    *mi = (unsigned)(s[14]-'0')*10 + (unsigned)(s[15]-'0');
 }
 
 static int64_t days_from_civil(int y, unsigned m, unsigned d) {
@@ -229,90 +140,108 @@ static int64_t days_from_civil(int y, unsigned m, unsigned d) {
     return (int64_t)era * 146097 + (int64_t)doe - 719468;
 }
 
-static size_t weekday_from_iso(const char *s, size_t len) {
-    int64_t days = days_from_civil(iso_year(s, len), iso_month(s, len), iso_day(s, len));
+static inline size_t weekday_from_iso(const char *s, size_t len) {
+    int y; unsigned m, d, h, mi;
+    iso_ymdhm(s, len, &y, &m, &d, &h, &mi);
+    int64_t days = days_from_civil(y, m, d);
     int64_t w = ((days + 3) % 7 + 7) % 7;
     return (size_t)w;
 }
 
-static int64_t iso_to_epoch_seconds(const char *s, size_t len) {
-    int64_t days = days_from_civil(iso_year(s, len), iso_month(s, len), iso_day(s, len));
-    return days * 86400 + (int64_t)iso_hour_utc(s, len) * 3600 + (int64_t)iso_minute(s, len) * 60;
-}
-
-static int64_t minutes_between_abs(const char *a, size_t a_len, const char *b, size_t b_len) {
-    int64_t diff = iso_to_epoch_seconds(a, a_len) - iso_to_epoch_seconds(b, b_len);
-    if (diff < 0) diff = -diff;
-    return diff / 60;
+static inline int64_t iso_to_epoch_minutes(const char *s, size_t len) {
+    int y; unsigned m, d, h, mi;
+    iso_ymdhm(s, len, &y, &m, &d, &h, &mi);
+    int64_t days = days_from_civil(y, m, d);
+    return days * 1440 + (int64_t)h * 60 + (int64_t)mi;
 }
 
 int vectorizer_build(const char *body, size_t body_len, float out[VEC_DIM]) {
     memset(out, 0, VEC_DIM * sizeof(float));
 
-    size_t t_start, t_len, c_start, c_len, m_start, m_len, tm_start, tm_len;
-    if (!object_range(body, body_len, "transaction", &t_start, &t_len)) return 0;
-    if (!object_range(body, body_len, "customer", &c_start, &c_len)) return 0;
-    if (!object_range(body, body_len, "merchant", &m_start, &m_len)) return 0;
-    if (!object_range(body, body_len, "terminal", &tm_start, &tm_len)) return 0;
+    parser_t p = { body, body_len, 0 };
 
-    const char *tx = body + t_start; size_t txl = t_len;
-    const char *cust = body + c_start; size_t custl = c_len;
-    const char *merch = body + m_start; size_t merchl = m_len;
-    const char *term = body + tm_start; size_t terml = tm_len;
+    /* { "id": "...", ... } */
+    expect_char(&p, '{');
+    skip_string(&p); expect_char(&p, ':'); skip_string(&p); expect_char(&p, ',');
 
-    float amount, installments, customer_avg_amount, tx_count_24h;
-    float merchant_avg_amount, km_from_home;
-    if (!json_number(tx, txl, "amount", &amount)) return 0;
-    if (!json_number(tx, txl, "installments", &installments)) return 0;
-    if (!json_number(cust, custl, "avg_amount", &customer_avg_amount)) return 0;
-    if (!json_number(cust, custl, "tx_count_24h", &tx_count_24h)) return 0;
-    if (!json_number(merch, merchl, "avg_amount", &merchant_avg_amount)) return 0;
-    if (!json_number(term, terml, "km_from_home", &km_from_home)) return 0;
+    /* "transaction": { amount, installments, requested_at } */
+    skip_string(&p); expect_char(&p, ':'); expect_char(&p, '{');
+    skip_string(&p); expect_char(&p, ':'); float amount = parse_f32(&p); expect_char(&p, ',');
+    skip_string(&p); expect_char(&p, ':'); float installments = parse_f32(&p); expect_char(&p, ',');
+    skip_string(&p); expect_char(&p, ':'); const char *req_ts; size_t req_ts_len; parse_string_bounds(&p, &req_ts, &req_ts_len); expect_char(&p, '}'); expect_char(&p, ',');
 
-    size_t ra_start, ra_len;
-    if (!json_string(tx, txl, "requested_at", &ra_start, &ra_len)) return 0;
-    const char *requested_at = tx + ra_start;
-    size_t ra_len2 = ra_len;
+    /* "customer": { avg_amount, tx_count_24h, known_merchants } */
+    skip_string(&p); expect_char(&p, ':'); expect_char(&p, '{');
+    skip_string(&p); expect_char(&p, ':'); float customer_avg_amount = parse_f32(&p); expect_char(&p, ',');
+    skip_string(&p); expect_char(&p, ':'); float tx_count_24h = parse_f32(&p); expect_char(&p, ',');
+    skip_string(&p); expect_char(&p, ':');
 
-    size_t mid_start, mid_len;
-    if (!json_string(merch, merchl, "id", &mid_start, &mid_len)) return 0;
-    const char *merchant_id = merch + mid_start;
-    size_t mid_len2 = mid_len;
+    /* Parse known_merchants array into temp buffer */
+    const char *merchants[32];
+    size_t merchant_lens[32];
+    int num_merchants = 0;
+    expect_char(&p, '[');
+    while (1) {
+        skip_ws(&p);
+        if (p.pos < p.len && p.s[p.pos] == ']') { p.pos++; break; }
+        const char *m_start; size_t m_len;
+        parse_string_bounds(&p, &m_start, &m_len);
+        if (num_merchants < 32) {
+            merchants[num_merchants] = m_start;
+            merchant_lens[num_merchants] = m_len;
+            num_merchants++;
+        }
+        skip_ws(&p);
+        if (p.pos < p.len && p.s[p.pos] == ',') p.pos++;
+    }
+    expect_char(&p, '}'); expect_char(&p, ',');
 
-    size_t mcc_start, mcc_len;
-    if (!json_string(merch, merchl, "mcc", &mcc_start, &mcc_len)) return 0;
+    /* "merchant": { id, mcc, avg_amount } */
+    skip_string(&p); expect_char(&p, ':'); expect_char(&p, '{');
+    skip_string(&p); expect_char(&p, ':'); const char *merchant_id; size_t merchant_id_len; parse_string_bounds(&p, &merchant_id, &merchant_id_len); expect_char(&p, ',');
+    skip_string(&p); expect_char(&p, ':'); const char *mcc_str; size_t mcc_len; parse_string_bounds(&p, &mcc_str, &mcc_len); expect_char(&p, ',');
+    skip_string(&p); expect_char(&p, ':'); float merchant_avg_amount = parse_f32(&p); expect_char(&p, '}'); expect_char(&p, ',');
 
-    int is_online, card_present;
-    if (!json_bool(term, terml, "is_online", &is_online)) return 0;
-    if (!json_bool(term, terml, "card_present", &card_present)) return 0;
-
-    float minutes_since_last_tx = -1.0f;
-    float km_from_current = -1.0f;
-
-    size_t lt_start, lt_len;
-    if (object_range(body, body_len, "last_transaction", &lt_start, &lt_len)) {
-        const char *lt = body + lt_start;
-        size_t ltl = lt_len;
-        size_t ts_start, ts_len;
-        float km;
-        if (json_string(lt, ltl, "timestamp", &ts_start, &ts_len) &&
-            json_number(lt, ltl, "km_from_current", &km)) {
-            const char *last_ts = lt + ts_start;
-            int64_t mins = minutes_between_abs(requested_at, ra_len2, last_ts, ts_len);
-            minutes_since_last_tx = clamp01((float)mins / 1440.0f);
-            km_from_current = clamp01(km / 1000.0f);
+    /* Check if merchant_id is in known_merchants */
+    int known_merchant = 0;
+    for (int i = 0; i < num_merchants; i++) {
+        if (merchant_lens[i] == merchant_id_len && memcmp(merchants[i], merchant_id, merchant_id_len) == 0) {
+            known_merchant = 1;
+            break;
         }
     }
 
-    int known_merchant = array_contains_string(cust, custl, "known_merchants", merchant_id, mid_len2);
-    int is_unknown_merchant = !known_merchant;
+    /* "terminal": { is_online, card_present, km_from_home } */
+    skip_string(&p); expect_char(&p, ':'); expect_char(&p, '{');
+    skip_string(&p); expect_char(&p, ':'); int is_online = parse_bool(&p); expect_char(&p, ',');
+    skip_string(&p); expect_char(&p, ':'); int card_present = parse_bool(&p); expect_char(&p, ',');
+    skip_string(&p); expect_char(&p, ':'); float km_from_home = parse_f32(&p); expect_char(&p, '}'); expect_char(&p, ',');
 
-    /* parse MCC string to int */
-    char mcc_buf[16];
-    size_t mcc_num_len = mcc_len < 15 ? mcc_len : 15;
-    memcpy(mcc_buf, merch + mcc_start, mcc_num_len);
-    mcc_buf[mcc_num_len] = '\0';
-    unsigned mcc = (unsigned)atoi(mcc_buf);
+    /* "last_transaction": null or { timestamp, km_from_current } */
+    skip_string(&p); expect_char(&p, ':');
+    float minutes_since_last_tx = -1.0f;
+    float km_from_current = -1.0f;
+    skip_ws(&p);
+    if (p.pos < p.len && p.s[p.pos] == 'n') {
+        p.pos += 4;
+    } else {
+        expect_char(&p, '{');
+        skip_string(&p); expect_char(&p, ':'); const char *last_ts; size_t last_ts_len; parse_string_bounds(&p, &last_ts, &last_ts_len); expect_char(&p, ',');
+        skip_string(&p); expect_char(&p, ':'); km_from_current = parse_f32(&p); expect_char(&p, '}');
+        int64_t req_mins = iso_to_epoch_minutes(req_ts, req_ts_len);
+        int64_t last_mins = iso_to_epoch_minutes(last_ts, last_ts_len);
+        int64_t diff = req_mins - last_mins;
+        if (diff < 0) diff = -diff;
+        minutes_since_last_tx = clamp01((float)diff / 1440.0f);
+        km_from_current = clamp01(km_from_current / 1000.0f);
+    }
+
+    /* Parse MCC */
+    unsigned mcc = 0;
+    for (size_t i = 0; i < mcc_len && i < 4; i++) {
+        if (mcc_str[i] >= '0' && mcc_str[i] <= '9')
+            mcc = mcc * 10 + (unsigned)(mcc_str[i] - '0');
+    }
 
     float ratio = (customer_avg_amount > 0.0f)
         ? (amount / customer_avg_amount) / 10.0f
@@ -321,15 +250,15 @@ int vectorizer_build(const char *body, size_t body_len, float out[VEC_DIM]) {
     out[0]  = clamp01(amount / 10000.0f);
     out[1]  = clamp01(installments / 12.0f);
     out[2]  = clamp01(ratio);
-    out[3]  = round4((float)iso_hour_utc(requested_at, ra_len2) / 23.0f);
-    out[4]  = round4((float)weekday_from_iso(requested_at, ra_len2) / 6.0f);
+    out[3]  = clamp01((float)iso_hour(req_ts, req_ts_len) / 23.0f);
+    out[4]  = clamp01((float)weekday_from_iso(req_ts, req_ts_len) / 6.0f);
     out[5]  = minutes_since_last_tx;
     out[6]  = km_from_current;
     out[7]  = clamp01(km_from_home / 1000.0f);
     out[8]  = clamp01(tx_count_24h / 20.0f);
     out[9]  = is_online ? 1.0f : 0.0f;
     out[10] = card_present ? 1.0f : 0.0f;
-    out[11] = is_unknown_merchant ? 1.0f : 0.0f;
+    out[11] = known_merchant ? 0.0f : 1.0f;
     out[12] = mcc_risk_f(mcc);
     out[13] = clamp01(merchant_avg_amount / 10000.0f);
 

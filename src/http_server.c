@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "http_server.h"
 #include "http_resp.h"
 #include "vectorizer.h"
@@ -16,33 +17,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/epoll.h>
 
 #define REQ_BUF_SIZE 32768
+#define MAX_EVENTS 128
 
-static uint64_t g_time_read_total = 0;
-static uint64_t g_time_vectorize_total = 0;
-static uint64_t g_time_search_total = 0;
-static uint64_t g_time_write_total = 0;
-static uint64_t g_req_count = 0;
-
-static inline uint64_t hr_nanos(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static int write_all(int fd, const char *data, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = write(fd, data + sent, len - sent);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        sent += (size_t)n;
-    }
-    return 0;
+static inline int send_all(int fd, const char *data, size_t len) {
+    ssize_t n = send(fd, data, len, MSG_NOSIGNAL);
+    return (n == (ssize_t)len) ? 0 : -1;
 }
 
 static size_t find_content_length(const char *headers, size_t headers_len) {
@@ -69,106 +57,123 @@ static size_t find_content_length(const char *headers, size_t headers_len) {
     return (size_t)-1;
 }
 
-static void handle_connection(int fd) {
+typedef struct {
+    int fd;
     char req_buf[REQ_BUF_SIZE];
-    size_t req_len = 0;
+    size_t req_len;
+    int active;
+} conn_t;
+
+static conn_t g_conns[MAX_EVENTS] __attribute__((aligned(64)));
+
+static conn_t *conn_new(int fd) {
+    for (int i = 0; i < MAX_EVENTS; i++) {
+        if (!g_conns[i].active) {
+            g_conns[i].fd = fd;
+            g_conns[i].req_len = 0;
+            g_conns[i].active = 1;
+            return &g_conns[i];
+        }
+    }
+    return NULL;
+}
+
+static void conn_close(conn_t *c) {
+    if (c->fd >= 0) {
+        close(c->fd);
+        c->fd = -1;
+    }
+    c->active = 0;
+    c->req_len = 0;
+}
+
+static int handle_request(conn_t *c) {
+    char *req_buf = c->req_buf;
+    size_t req_len = c->req_len;
+    int fd = c->fd;
+
+    char *hdr_end = memmem(req_buf, req_len, "\r\n\r\n", 4);
+    if (!hdr_end) {
+        if (req_len >= REQ_BUF_SIZE - 1) return -1;
+        return 0;
+    }
+
+    size_t header_len = (size_t)(hdr_end - req_buf);
+    size_t body_start = header_len + 4;
+
+    if (memcmp(req_buf, "GET /ready", 10) == 0) {
+        if (send_all(fd, resp_ready, resp_ready_len) != 0) return -1;
+        c->req_len = 0;
+        return 1;
+    }
+
+    if (memcmp(req_buf, "GET /inst", 9) == 0) {
+        const char *msg = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ninst disabled\n";
+        send_all(fd, msg, 48);
+        return -1;
+    }
+
+    if (memcmp(req_buf, "POST /fraud-score", 17) == 0) {
+        size_t cl = find_content_length(req_buf, header_len);
+        if (cl == (size_t)-1) {
+            if (send_all(fd, resp_bad_req, resp_bad_req_len) != 0) return -1;
+            c->req_len = 0;
+            return 1;
+        }
+        if (req_len < body_start + cl) {
+            if (req_len + cl >= REQ_BUF_SIZE) return -1;
+            return 0;
+        }
+
+        float q[VEC_DIM];
+        if (!vectorizer_build(req_buf + body_start, cl, q)) {
+            if (send_all(fd, resp_bad_req, resp_bad_req_len) != 0) return -1;
+            c->req_len = 0;
+            return 1;
+        }
+
+        int frauds = rinha_search(q);
+        if (frauds > 5) {
+            if (send_all(fd, resp_internal_err, resp_internal_err_len) != 0) return -1;
+            c->req_len = 0;
+            return 1;
+        }
+        const char *resp = score_for((uint8_t)frauds);
+        if (send_all(fd, resp, score_len[(uint8_t)frauds]) != 0) return -1;
+
+        size_t consumed = body_start + cl;
+        if (req_len > consumed) {
+            memmove(req_buf, req_buf + consumed, req_len - consumed);
+            c->req_len = req_len - consumed;
+            return 2;
+        }
+        c->req_len = 0;
+        return 1;
+    }
+
+    if (send_all(fd, resp_not_found, resp_not_found_len) != 0) return -1;
+    c->req_len = 0;
+    return 1;
+}
+
+static int process_conn(conn_t *c) {
+    int fd = c->fd;
+    char *req_buf = c->req_buf;
+    size_t *req_len = &c->req_len;
 
     while (1) {
-        ssize_t n = read(fd, req_buf + req_len, REQ_BUF_SIZE - req_len);
+        ssize_t n = recv(fd, req_buf + *req_len, REQ_BUF_SIZE - *req_len, 0);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            return;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            return -1;
         }
-        if (n == 0) return;
-        req_len += (size_t)n;
+        if (n == 0) return -1;
+        *req_len += (size_t)n;
 
-        /* look for end of headers */
-        char *hdr_end = memmem(req_buf, req_len, "\r\n\r\n", 4);
-        if (!hdr_end) {
-            if (req_len >= REQ_BUF_SIZE - 1) return;
-            continue;
-        }
-
-        size_t header_len = (size_t)(hdr_end - req_buf);
-        size_t body_start = header_len + 4;
-
-        if (memcmp(req_buf, "GET /ready", 10) == 0) {
-            write_all(fd, resp_ready, strlen(resp_ready));
-            return;
-        }
-
-        if (memcmp(req_buf, "GET /inst", 9) == 0) {
-            uint64_t inst[7];
-            rinha_get_inst(inst);
-            char ibuf[1024];
-            int ilen = snprintf(ibuf, sizeof(ibuf),
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
-                "=== Pipeline (avg ns/req, %llu reqs) ===\n"
-                "read:       %llu\n"
-                "vectorize:  %llu\n"
-                "search:     %llu\n"
-                "write:      %llu\n"
-                "\n=== Search breakdown (avg ns/search, %llu searches) ===\n"
-                "quantize:   %llu\n"
-                "centroids:  %llu\n"
-                "topn:       %llu\n"
-                "reorder:    %llu\n"
-                "fast_scan:  %llu\n"
-                "full_scan:  %llu\n",
-                (unsigned long long)g_req_count,
-                (unsigned long long)(g_req_count ? g_time_read_total / g_req_count : 0),
-                (unsigned long long)(g_req_count ? g_time_vectorize_total / g_req_count : 0),
-                (unsigned long long)(g_req_count ? g_time_search_total / g_req_count : 0),
-                (unsigned long long)(g_req_count ? g_time_write_total / g_req_count : 0),
-                (unsigned long long)inst[6],
-                (unsigned long long)(inst[6] ? inst[0] / inst[6] : 0),
-                (unsigned long long)(inst[6] ? inst[1] / inst[6] : 0),
-                (unsigned long long)(inst[6] ? inst[2] / inst[6] : 0),
-                (unsigned long long)(inst[6] ? inst[3] / inst[6] : 0),
-                (unsigned long long)(inst[6] ? inst[4] / inst[6] : 0),
-                (unsigned long long)(inst[6] ? inst[5] / inst[6] : 0));
-            write_all(fd, ibuf, (size_t)ilen);
-            return;
-        }
-
-        if (memcmp(req_buf, "POST /fraud-score", 17) == 0) {
-            size_t cl = find_content_length(req_buf, header_len);
-            if (cl == (size_t)-1) {
-                write_all(fd, resp_bad_req, strlen(resp_bad_req));
-                return;
-            }
-            if (req_len < body_start + cl) {
-                /* need more data */
-                if (req_len + cl >= REQ_BUF_SIZE) return;
-                continue;
-            }
-
-            g_req_count++;
-
-            uint64_t t_vec = hr_nanos();
-            float q[VEC_DIM];
-            if (!vectorizer_build(req_buf + body_start, cl, q)) {
-                write_all(fd, resp_bad_req, strlen(resp_bad_req));
-                return;
-            }
-            g_time_vectorize_total += hr_nanos() - t_vec;
-
-            uint64_t t_search = hr_nanos();
-            int frauds = rinha_search(q);
-            g_time_search_total += hr_nanos() - t_search;
-            if (frauds > 5) {
-                write_all(fd, resp_internal_err, strlen(resp_internal_err));
-                return;
-            }
-            const char *resp = score_for((uint8_t)frauds);
-            uint64_t t_write = hr_nanos();
-            write_all(fd, resp, strlen(resp));
-            g_time_write_total += hr_nanos() - t_write;
-            return;
-        }
-
-        write_all(fd, resp_not_found, strlen(resp_not_found));
-        return;
+        int rc = handle_request(c);
+        if (rc < 0) return -1;
+        if (rc == 0) return 0;
+        if (rc == 1) return 1;
     }
 }
 
@@ -200,7 +205,7 @@ static int create_tcp_socket(const config_t *cfg) {
         inet_aton(cfg->host, &addr.sin_addr);
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { close(fd); return -1; }
-    if (listen(fd, 128) != 0) { close(fd); return -1; }
+    if (listen(fd, 1024) != 0) { close(fd); return -1; }
 
     fprintf(stderr, "listening TCP %s:%d\n", cfg->host, cfg->port);
     return fd;
@@ -222,7 +227,7 @@ static int create_uds_socket(const config_t *cfg) {
     addr.sun_path[path_len] = '\0';
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { close(fd); return -1; }
-    if (listen(fd, 128) != 0) { close(fd); return -1; }
+    if (listen(fd, 1024) != 0) { close(fd); return -1; }
 
     chmod(cfg->uds_path, octal_from_decimal(cfg->uds_mode));
 
@@ -242,19 +247,80 @@ int server_run(const config_t *cfg) {
         return -1;
     }
 
-    while (1) {
-        struct sockaddr client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, &client_addr, &client_len);
-        if (client_fd < 0) {
-            if (errno == EINTR) continue;
-            fprintf(stderr, "accept error: %d\n", errno);
-            continue;
-        }
-        handle_connection(client_fd);
-        close(client_fd);
+    if (set_nonblocking(server_fd) < 0) {
+        close(server_fd);
+        return -1;
     }
 
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd < 0) {
+        close(server_fd);
+        return -1;
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.ptr = NULL;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
+        close(epoll_fd);
+        close(server_fd);
+        return -1;
+    }
+
+    struct epoll_event events[MAX_EVENTS];
+
+    while (1) {
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if (nfds < 0) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait");
+            break;
+        }
+
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.ptr == NULL) {
+                while (1) {
+                    struct sockaddr client_addr;
+                    socklen_t client_len = sizeof(client_addr);
+                    int client_fd = accept4(server_fd, &client_addr, &client_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                    if (client_fd < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        if (errno == EINTR) continue;
+                        fprintf(stderr, "accept error: %d\n", errno);
+                        break;
+                    }
+
+                    conn_t *c = conn_new(client_fd);
+                    if (!c) {
+                        close(client_fd);
+                        continue;
+                    }
+
+                    /* TCP_NODELAY for low-latency responses */
+                    int opt = 1;
+                    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+                    struct epoll_event cev;
+                    cev.events = EPOLLIN | EPOLLET;
+                    cev.data.ptr = c;
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
+                        conn_close(c);
+                        continue;
+                    }
+                }
+            } else {
+                conn_t *c = (conn_t *)events[i].data.ptr;
+                int rc = process_conn(c);
+                if (rc < 0) {
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
+                    conn_close(c);
+                }
+            }
+        }
+    }
+
+    /* Close any remaining connections */
+    close(epoll_fd);
     close(server_fd);
     return 0;
 }

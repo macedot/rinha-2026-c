@@ -1,8 +1,8 @@
 CC = gcc
-CFLAGS = -O3 -march=haswell -flto -fomit-frame-pointer -fno-plt \
+CFLAGS = -O3 -march=haswell -mtune=haswell -flto -fomit-frame-pointer -fno-plt \
          -fno-semantic-interposition -fno-trapping-math \
          -DNDEBUG -Wall -Wextra -Ibridge
-LDFLAGS = -static -lm
+LDFLAGS = -static -flto -s -lm
 
 SRCS = src/main.c src/config.c bridge/bridge.c src/http_server.c src/http_resp.c src/vectorizer.c
 TARGET = rinha-server
