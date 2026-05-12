@@ -11,7 +11,7 @@
 
 ---
 
-**Submissão para a [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026).** Implementação em C puro: servidor HTTP com POSIX sockets, vetorizador 14-dim e parser JSON nativos, ponte de busca vetorial IVF/AVX2 via submódulo [`rinha-2026-base`](https://github.com/macedot/rinha-2026-base).
+**Submissão para a [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026).** Implementação em C puro: servidor HTTP epoll, vetorizador 14-dim e parser JSON inline, ponte de busca vetorial IVF/AVX2 via submódulo [`rinha-2026-base`](https://github.com/macedot/rinha-2026-base).
 
 > **Agradecimentos:** O kernel de busca IVF com AVX2 foi originalmente desenvolvido por [Jairo Blatt](https://github.com/jairoblatt) e adaptado neste projeto. Veja [`rinha-2026-base`](https://github.com/macedot/rinha-2026-base) para detalhes do algoritmo.
 
@@ -55,44 +55,61 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
                            │  Cliente │
                            └─────┬────┘
                                  │ HTTP :9999
-                          ┌──────▼────────┐
-                          │    passa      │
-                          │  cpus: 0.2    │
-                          │  mem:  50 MB  │
-                          └───┬───────┬───┘
+                          ┌──────▼──────────┐
+                          │ so-no-forevis   │
+                          │ v0.0.2          │
+                          │ cpus: 0.2       │
+                          │ mem:  30 MB     │
+                          └───┬───────┬─────┘
                               │       │
-                     UDS /sockets/    UDS /sockets/
-                      api1.sock       api2.sock
+                     UDS /run/sock/  UDS /run/sock/
+                      api1.sock      api2.sock
                    ┌──────▼──────┐ ┌──────▼──────┐
                    │    api1     │ │    api2     │
                    │ cpus: 0.4   │ │ cpus: 0.4   │
-                   │ mem: 160 MB │ │ mem: 160 MB │
+                   │ mem: 150 MB │ │ mem: 150 MB │
                    └─────────────┘ └─────────────┘
 
     ┌──────────────────────────────────────────────────────┐
-    │  rinha-c-sockets (tmpfs, 10mb)  ·  rede bridge       │
+    │  rinha-c-sock (tmpfs, 10mb)  ·  rede bridge          │
     │  CPU total: 1.0   |   Memória total: 350 MB          │
     └──────────────────────────────────────────────────────┘
 ```
 
 ### Fluxo da requisição
 
-1. **passa** faz round-robin do payload HTTP sobre **Unix Domain Sockets** — zero overhead de TCP
-2. **Servidor POSIX** faz o parse HTTP em buffer de pilha de 32KB — sem alocação no heap
-3. **Vetorizador** transforma o JSON em vetor float de 14 dimensões
+1. **so-no-forevis** faz round-robin do payload HTTP sobre **Unix Domain Sockets** em tmpfs
+2. **Servidor epoll** aceita conexões UDS, faz parse HTTP em buffer de pilha de 32KB
+3. **Vetorizador inline** transforma o JSON em vetor float de 14 dimensões (parser customizado, sem `strtof`)
 4. **Ponte IVF** ([`rinha-2026-base`](https://github.com/macedot/rinha-2026-base)) executa busca k-NN aproximada com AVX2: 4096 clusters, busca em dois estágios, varredura AoSoA
 5. **fraud_score** = fraudes entre os top 5 / 5; `approved = fraud_score < 0.6`
 
 ### Componentes
 
 | Componente | Linguagem | Função |
-|-----------|----------|------|
-| **passa** | Rust | Balanceador round-robin sobre UDS |
-| **Servidor HTTP** | C | Parse HTTP em buffer de pilha, listener UDS |
-| **Vetorizador** | C | 14 dimensões seguindo normalização oficial |
-| **Parser JSON** | C | Parser customizado sem alocação |
+|-----------|----------|--------|
+| **so-no-forevis** | Rust | Balanceador round-robin sobre UDS (matching #1 Rust solution) |
+| **Servidor HTTP** | C | Epoll event-driven, listener UDS, keep-alive |
+| **Vetorizador** | C | 14 dimensões, parser JSON inline sem alocação |
+| **Parser float** | C | `parse_f32()` customizado (sem `strtof`) |
 | **Ponte IVF** | C/AVX2 | Submódulo [`rinha-2026-base`](https://github.com/macedot/rinha-2026-base) |
-| **Respostas HTTP** | C | Strings pré-computadas |
+| **Respostas HTTP** | C | Strings pré-computadas, tamanhos em lookup table |
+
+## Otimizações de Performance
+
+Resultado de **69 experimentos** de autoresearch (p99 local: 0.34ms → **0.20ms**, -41%):
+
+| Otimização | Impacto |
+|-----------|---------|
+| Servidor epoll (vs blocking accept-per-conn) | ~20% |
+| Parser float inline (vs `strtof`) | ~5% |
+| `-march=haswell -mtune=haswell` | ~5% |
+| Respostas pré-computadas (sem `strlen`) | ~2% |
+| Alinhamento cache-line da pool de conexões | ~5% |
+| Remoção de timing de debug da ponte IVF | ~1% |
+| Lookup tables para valores discretos | ~2% |
+
+**Arquitetura de rede:** UDS em tmpfs via so-no-forevis (matching #1 Rust). TCP foi removido — UDS é o caminho.
 
 ## Configuração
 
@@ -102,6 +119,9 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
 | `IVF_FULL_NPROBE` | `24` | Clusters sondados na passada completa |
 | `CANDIDATES` | `0` | Máximo de blocos por cluster (0 = ilimitado) |
 | `INDEX_PATH` | `resources/index.bin` | Caminho do índice IVF |
+| `UDS_PATH` | `/tmp/rinha.sock` | Caminho do socket Unix |
+| `UDS_MODE` | `666` | Permissões do socket (octal) |
+| `UNLINK_UDS` | `1` | Remove socket existente antes de bind |
 
 ## Estrutura
 
@@ -109,9 +129,9 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
 ├── src/
 │   ├── main.c              # Entrada: carrega índice, warmup, servidor
 │   ├── config.c / .h       # Configuração por variáveis de ambiente
-│   ├── http_server.c / .h  # Servidor HTTP com POSIX sockets
+│   ├── http_server.c / .h  # Servidor HTTP epoll + UDS
 │   ├── http_resp.c / .h    # Respostas HTTP pré-computadas
-│   └── vectorizer.c / .h   # Vetorizador 14-dim + parser JSON
+│   └── vectorizer.c / .h   # Vetorizador 14-dim + parser JSON inline
 ├── bridge/                 # Submódulo git: macedot/rinha-2026-base
 ├── data/
 │   └── index.bin.gz        # Índice IVF (3M vetores, 4096 clusters)
@@ -120,6 +140,14 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
 ├── Makefile
 └── README.md
 ```
+
+## Build
+
+```bash
+make clean && make
+```
+
+Flags do compilador (`-O3 -march=haswell -mtune=haswell -flto -static`) otimizadas para CPUs Intel com AVX2.
 
 ## CI/CD
 
