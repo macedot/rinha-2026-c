@@ -43,14 +43,20 @@ int ctrl_socket_create(const char *base_path) {
     return fd;
 }
 
-/* Accept a connection on ctrl socket and receive one FD via SCM_RIGHTS.
-   Returns the received FD, or -1 on error. */
-int ctrl_recv_fd(int ctrl_fd) {
+/* Accept a new ctrl connection from the LB.
+   Returns the connection FD, or -1 on error. */
+int ctrl_accept(int ctrl_fd) {
     struct sockaddr_un addr;
     socklen_t addr_len = sizeof(addr);
     int conn_fd = accept4(ctrl_fd, (struct sockaddr *)&addr, &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (conn_fd < 0) return -1;
+    return conn_fd;
+}
 
+/* Receive one FD from an established ctrl connection via SCM_RIGHTS.
+   Returns the received FD, or -1 on error/EOF.
+   The caller keeps the ctrl connection open for more FDs. */
+int ctrl_recv_fd(int conn_fd) {
     union {
         char buf[CMSG_SPACE(sizeof(int))];
         struct cmsghdr align;
@@ -70,8 +76,7 @@ int ctrl_recv_fd(int ctrl_fd) {
     memset(cmsg_u.buf, 0, sizeof(cmsg_u.buf));
 
     ssize_t n = recvmsg(conn_fd, &msg, 0);
-    close(conn_fd);
-    if (n < 0) return -1;
+    if (n <= 0) return -1; /* EOF or error */
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     if (!cmsg) return -1;
