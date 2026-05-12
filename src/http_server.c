@@ -3,6 +3,7 @@
 #include "http_resp.h"
 #include "vectorizer.h"
 #include "bridge.h"
+#include "scm_rights.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -207,7 +208,6 @@ static int create_uds_socket(const config_t *cfg) {
 
 int server_run(const config_t *cfg) {
     int server_fd = create_uds_socket(cfg);
-
     if (server_fd < 0) {
         fprintf(stderr, "failed to create socket\n");
         return -1;
@@ -218,8 +218,22 @@ int server_run(const config_t *cfg) {
         return -1;
     }
 
+    /* Create .ctrl socket for SCM_RIGHTS fd passing from LB */
+    int ctrl_fd = ctrl_socket_create(cfg->uds_path);
+    if (ctrl_fd < 0) {
+        fprintf(stderr, "failed to create ctrl socket\n");
+        close(server_fd);
+        return -1;
+    }
+    if (set_nonblocking(ctrl_fd) < 0) {
+        close(ctrl_fd);
+        close(server_fd);
+        return -1;
+    }
+
     int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd < 0) {
+        close(ctrl_fd);
         close(server_fd);
         return -1;
     }
@@ -229,6 +243,16 @@ int server_run(const config_t *cfg) {
     ev.data.ptr = NULL;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
         close(epoll_fd);
+        close(ctrl_fd);
+        close(server_fd);
+        return -1;
+    }
+
+    ev.events = EPOLLIN;
+    ev.data.ptr = (void *)(uintptr_t)(-1); /* -1 marks ctrl socket */
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ctrl_fd, &ev) < 0) {
+        close(epoll_fd);
+        close(ctrl_fd);
         close(server_fd);
         return -1;
     }
@@ -244,7 +268,34 @@ int server_run(const config_t *cfg) {
         }
 
         for (int i = 0; i < nfds; i++) {
-            if (events[i].data.ptr == NULL) {
+            uintptr_t tag = (uintptr_t)events[i].data.ptr;
+
+            if (tag == (uintptr_t)(-1)) {
+                /* Ctrl socket: receive FDs via SCM_RIGHTS */
+                while (1) {
+                    int client_fd = ctrl_recv_fd(ctrl_fd);
+                    if (client_fd < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        if (errno == EINTR) continue;
+                        break;
+                    }
+
+                    conn_t *c = conn_new(client_fd);
+                    if (!c) {
+                        close(client_fd);
+                        continue;
+                    }
+
+                    struct epoll_event cev;
+                    cev.events = EPOLLIN | EPOLLET;
+                    cev.data.ptr = c;
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
+                        conn_close(c);
+                        continue;
+                    }
+                }
+            } else if (tag == 0) {
+                /* Main UDS socket: direct connections (health checks) */
                 while (1) {
                     struct sockaddr client_addr;
                     socklen_t client_len = sizeof(client_addr);
@@ -281,8 +332,8 @@ int server_run(const config_t *cfg) {
         }
     }
 
-    /* Close any remaining connections */
     close(epoll_fd);
+    close(ctrl_fd);
     close(server_fd);
     return 0;
 }
