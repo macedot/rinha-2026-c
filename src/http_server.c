@@ -206,6 +206,33 @@ static int create_uds_socket(const config_t *cfg) {
     return fd;
 }
 
+/* Ctrl connection tracking for SCM_RIGHTS */
+#define MAX_CTRL_CONNS 4
+static int g_ctrl_conns[MAX_CTRL_CONNS];
+static int g_ctrl_count = 0;
+
+static int ctrl_conn_add(int fd) {
+    if (g_ctrl_count >= MAX_CTRL_CONNS) return -1;
+    g_ctrl_conns[g_ctrl_count] = fd;
+    return g_ctrl_count++;
+}
+
+static void ctrl_conn_remove(int idx) {
+    if (idx < 0 || idx >= g_ctrl_count) return;
+    close(g_ctrl_conns[idx]);
+    for (int i = idx; i < g_ctrl_count - 1; i++) {
+        g_ctrl_conns[i] = g_ctrl_conns[i + 1];
+    }
+    g_ctrl_count--;
+}
+
+static int ctrl_conn_find(int fd) {
+    for (int i = 0; i < g_ctrl_count; i++) {
+        if (g_ctrl_conns[i] == fd) return i;
+    }
+    return -1;
+}
+
 int server_run(const config_t *cfg) {
     int server_fd = create_uds_socket(cfg);
     if (server_fd < 0) {
@@ -219,40 +246,40 @@ int server_run(const config_t *cfg) {
     }
 
     /* Create .ctrl socket for SCM_RIGHTS fd passing from LB */
-    int ctrl_fd = ctrl_socket_create(cfg->uds_path);
-    if (ctrl_fd < 0) {
+    int ctrl_listen_fd = ctrl_socket_create(cfg->uds_path);
+    if (ctrl_listen_fd < 0) {
         fprintf(stderr, "failed to create ctrl socket\n");
         close(server_fd);
         return -1;
     }
-    if (set_nonblocking(ctrl_fd) < 0) {
-        close(ctrl_fd);
+    if (set_nonblocking(ctrl_listen_fd) < 0) {
+        close(ctrl_listen_fd);
         close(server_fd);
         return -1;
     }
 
     int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd < 0) {
-        close(ctrl_fd);
+        close(ctrl_listen_fd);
         close(server_fd);
         return -1;
     }
 
     struct epoll_event ev;
     ev.events = EPOLLIN;
-    ev.data.ptr = NULL;
+    ev.data.fd = server_fd;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
         close(epoll_fd);
-        close(ctrl_fd);
+        close(ctrl_listen_fd);
         close(server_fd);
         return -1;
     }
 
     ev.events = EPOLLIN;
-    ev.data.ptr = (void *)(uintptr_t)(-1); /* -1 marks ctrl socket */
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ctrl_fd, &ev) < 0) {
+    ev.data.fd = ctrl_listen_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ctrl_listen_fd, &ev) < 0) {
         close(epoll_fd);
-        close(ctrl_fd);
+        close(ctrl_listen_fd);
         close(server_fd);
         return -1;
     }
@@ -268,33 +295,31 @@ int server_run(const config_t *cfg) {
         }
 
         for (int i = 0; i < nfds; i++) {
-            uintptr_t tag = (uintptr_t)events[i].data.ptr;
+            int fd = events[i].data.fd;
 
-            if (tag == (uintptr_t)(-1)) {
-                /* Ctrl socket: receive FDs via SCM_RIGHTS */
+            if (fd == ctrl_listen_fd) {
+                /* Accept new ctrl connections from LB */
                 while (1) {
-                    int client_fd = ctrl_recv_fd(ctrl_fd);
-                    if (client_fd < 0) {
+                    int conn_fd = ctrl_accept(ctrl_listen_fd);
+                    if (conn_fd < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         if (errno == EINTR) continue;
                         break;
                     }
-
-                    conn_t *c = conn_new(client_fd);
-                    if (!c) {
-                        close(client_fd);
+                    int idx = ctrl_conn_add(conn_fd);
+                    if (idx < 0) {
+                        close(conn_fd);
                         continue;
                     }
-
                     struct epoll_event cev;
-                    cev.events = EPOLLIN | EPOLLET;
-                    cev.data.ptr = c;
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
-                        conn_close(c);
+                    cev.events = EPOLLIN;
+                    cev.data.fd = conn_fd;
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn_fd, &cev) < 0) {
+                        ctrl_conn_remove(idx);
                         continue;
                     }
                 }
-            } else if (tag == 0) {
+            } else if (fd == server_fd) {
                 /* Main UDS socket: direct connections (health checks) */
                 while (1) {
                     struct sockaddr client_addr;
@@ -321,7 +346,37 @@ int server_run(const config_t *cfg) {
                         continue;
                     }
                 }
+            } else if (ctrl_conn_find(fd) >= 0) {
+                /* Ctrl connection: receive FDs via SCM_RIGHTS */
+                while (1) {
+                    int client_fd = ctrl_recv_fd(fd);
+                    if (client_fd < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        /* EOF or error: close ctrl connection */
+                        int idx = ctrl_conn_find(fd);
+                        if (idx >= 0) {
+                            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                            ctrl_conn_remove(idx);
+                        }
+                        break;
+                    }
+
+                    conn_t *c = conn_new(client_fd);
+                    if (!c) {
+                        close(client_fd);
+                        continue;
+                    }
+
+                    struct epoll_event cev;
+                    cev.events = EPOLLIN | EPOLLET;
+                    cev.data.ptr = c;
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
+                        conn_close(c);
+                        continue;
+                    }
+                }
             } else {
+                /* Client connection: process HTTP */
                 conn_t *c = (conn_t *)events[i].data.ptr;
                 int rc = process_conn(c);
                 if (rc < 0) {
@@ -333,7 +388,7 @@ int server_run(const config_t *cfg) {
     }
 
     close(epoll_fd);
-    close(ctrl_fd);
+    close(ctrl_listen_fd);
     close(server_fd);
     return 0;
 }
