@@ -57,7 +57,7 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
                                  │ HTTP :9999
                           ┌──────▼──────────┐
                           │ so-no-forevis   │
-                          │ v0.0.2          │
+                          │ v1.0.0          │
                           │ cpus: 0.2       │
                           │ mem:  30 MB     │
                           └───┬───────┬─────┘
@@ -72,14 +72,14 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
 
     ┌──────────────────────────────────────────────────────┐
     │  rinha-c-sock (tmpfs, 10mb)  ·  rede bridge          │
-    │  CPU total: 1.0   |   Memória total: 350 MB          │
+    │  CPU total: 1.0   |   Memória total: 330 MB          │
     └──────────────────────────────────────────────────────┘
 ```
 
 ### Fluxo da requisição
 
-1. **so-no-forevis** faz round-robin do payload HTTP sobre **Unix Domain Sockets** em tmpfs
-2. **Servidor epoll** aceita conexões UDS, faz parse HTTP em buffer de pilha de 32KB
+1. **so-no-forevis** aceita conexões TCP e passa file descriptors via **SCM_RIGHTS** ao servidor C sobre Unix Domain Sockets. O servidor C trata o HTTP diretamente no socket TCP recebido.
+2. **Servidor epoll** aceita conexões UDS (e FDs passados via SCM_RIGHTS), faz parse HTTP em buffer de pilha de 32KB
 3. **Vetorizador inline** transforma o JSON em vetor float de 14 dimensões (parser customizado, sem `strtof`)
 4. **Ponte IVF** ([`rinha-2026-base`](https://github.com/macedot/rinha-2026-base)) executa busca k-NN aproximada com AVX2: 4096 clusters, busca em dois estágios, varredura AoSoA
 5. **fraud_score** = fraudes entre os top 5 / 5; `approved = fraud_score < 0.6`
@@ -88,7 +88,8 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
 
 | Componente | Linguagem | Função |
 |-----------|----------|--------|
-| **so-no-forevis** | Rust | Balanceador round-robin sobre UDS (matching #1 Rust solution) |
+| **so-no-forevis** | Rust | Balanceador round-robin, aceita TCP, passa FDs via SCM_RIGHTS |
+| **SCM_RIGHTS** | C | Recebe file descriptors TCP do LB via recvmsg() |
 | **Servidor HTTP** | C | Epoll event-driven, listener UDS, keep-alive |
 | **Vetorizador** | C | 14 dimensões, parser JSON inline sem alocação |
 | **Parser float** | C | `parse_f32()` customizado (sem `strtof`) |
@@ -97,7 +98,7 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
 
 ## Otimizações de Performance
 
-Resultado de **69 experimentos** de autoresearch (p99 local: 0.34ms → **0.20ms**, -41%):
+Score perfeito 6000 (p99=0.23ms, 0 falsos positivos, 0 falsos negativos, 54.100 requisições):
 
 | Otimização | Impacto |
 |-----------|---------|
@@ -108,8 +109,9 @@ Resultado de **69 experimentos** de autoresearch (p99 local: 0.34ms → **0.20ms
 | Alinhamento cache-line da pool de conexões | ~5% |
 | Remoção de timing de debug da ponte IVF | ~1% |
 | Lookup tables para valores discretos | ~2% |
+| SCM_RIGHTS fd passing (vs proxy) | ~15% |
 
-**Arquitetura de rede:** UDS em tmpfs via so-no-forevis (matching #1 Rust). TCP foi removido — UDS é o caminho.
+**Arquitetura de rede:** UDS em tmpfs via so-no-forevis v1.0.0 com SCM_RIGHTS. TCP foi removido — UDS + fd passing é o caminho.
 
 ## Configuração
 
@@ -119,7 +121,7 @@ Resultado de **69 experimentos** de autoresearch (p99 local: 0.34ms → **0.20ms
 | `IVF_FULL_NPROBE` | `24` | Clusters sondados na passada completa |
 | `CANDIDATES` | `0` | Máximo de blocos por cluster (0 = ilimitado) |
 | `INDEX_PATH` | `resources/index.bin` | Caminho do índice IVF |
-| `UDS_PATH` | `/tmp/rinha.sock` | Caminho do socket Unix |
+| `UDS_PATH` | `/tmp/rinha.sock` | Caminho do socket Unix (fallback: `SOCKET_PATH`) |
 | `UDS_MODE` | `666` | Permissões do socket (octal) |
 | `UNLINK_UDS` | `1` | Remove socket existente antes de bind |
 
@@ -131,10 +133,11 @@ Resultado de **69 experimentos** de autoresearch (p99 local: 0.34ms → **0.20ms
 │   ├── config.c / .h       # Configuração por variáveis de ambiente
 │   ├── http_server.c / .h  # Servidor HTTP epoll + UDS
 │   ├── http_resp.c / .h    # Respostas HTTP pré-computadas
+│   ├── scm_rights.c / .h   # Recebe FDs TCP via SCM_RIGHTS
 │   └── vectorizer.c / .h   # Vetorizador 14-dim + parser JSON inline
 ├── bridge/                 # Submódulo git: macedot/rinha-2026-base
-├── data/
-│   └── index.bin.gz        # Índice IVF (3M vetores, 4096 clusters)
+│   └── data/
+│       └── index.bin.gz    # Índice IVF (3M vetores, 4096 clusters)
 ├── Dockerfile
 ├── docker-compose.yml
 ├── Makefile
@@ -155,7 +158,7 @@ GitHub Actions publica imagem `ghcr.io/macedot/rinha-2026-c` a cada release.
 
 ## Ambiente de Teste
 
-Mac Mini Late 2014 (2.6 GHz Haswell, 8 GB RAM, Ubuntu 24.04). Limites Docker: **1.0 CPU** e **350 MB** de memória total.
+Mac Mini Late 2014 (2.6 GHz Haswell, 8 GB RAM, Ubuntu 24.04). Limites Docker: **1.0 CPU** e **330 MB** de memória total.
 
 ## Licença
 
