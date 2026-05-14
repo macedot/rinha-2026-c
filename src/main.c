@@ -9,6 +9,20 @@
 #include <sched.h>
 #include <unistd.h>
 #include <string.h>
+#include <time.h>
+
+static struct timespec ts_start;
+
+static void ts_init(void) {
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+}
+
+static long ts_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - ts_start.tv_sec) * 1000L
+         + (now.tv_nsec - ts_start.tv_nsec) / 1000000L;
+}
 static void maybe_pin_cpu(const config_t *cfg) {
     cpu_set_t avail;
     CPU_ZERO(&avail);
@@ -36,20 +50,22 @@ static void maybe_pin_cpu(const config_t *cfg) {
 }
 
 int main(void) {
+    ts_init();
     config_t cfg = config_load();
 
-    fprintf(stderr, "engine: C/AVX2 bridge implementation\n");
+    fprintf(stderr, "[%ldms] engine: C/AVX2 bridge implementation\n", ts_ms());
 
     maybe_pin_cpu(&cfg);
 
+    fprintf(stderr, "[%ldms] loading index: %s\n", ts_ms(), cfg.index_path);
     if (rinha_load_index(cfg.index_path) != 0) {
-        fprintf(stderr, "failed to load index: %s\n", cfg.index_path);
+        fprintf(stderr, "[%ldms] failed to load index: %s\n", ts_ms(), cfg.index_path);
         config_free(&cfg);
         return 1;
     }
     rinha_set_search_params(cfg.ivf_nprobe, cfg.ivf_full_nprobe, cfg.candidates);
 
-    fprintf(stderr, "warming caches...\n");
+    fprintf(stderr, "[%ldms] index loaded, warming caches...\n", ts_ms());
     {
         uint32_t state = 0x12345678;
         for (int i = 0; i < 500; i++) {
@@ -61,8 +77,9 @@ int main(void) {
             rinha_search(q);
         }
     }
-    fprintf(stderr, "cache warmup done\n");
+    fprintf(stderr, "[%ldms] cache warmup done\n", ts_ms());
 
+    fprintf(stderr, "[%ldms] starting server...\n", ts_ms());
     int rc = server_run(&cfg);
     config_free(&cfg);
     return rc;

@@ -181,11 +181,11 @@ int vectorizer_build(const char *body, size_t body_len, float out[VEC_DIM]) {
     size_t merchant_lens[32];
     int num_merchants = 0;
     expect_char(&p, '[');
-    while (1) {
-        skip_ws(&p);
-        if (p.pos < p.len && p.s[p.pos] == ']') { p.pos++; break; }
+    while (p.pos < p.len && p.s[p.pos] != ']') {
         const char *m_start; size_t m_len;
+        size_t prev = p.pos;
         parse_string_bounds(&p, &m_start, &m_len);
+        if (p.pos == prev) break; /* no progress — malformed input */
         if (num_merchants < 32) {
             merchants[num_merchants] = m_start;
             merchant_lens[num_merchants] = m_len;
@@ -194,6 +194,7 @@ int vectorizer_build(const char *body, size_t body_len, float out[VEC_DIM]) {
         skip_ws(&p);
         if (p.pos < p.len && p.s[p.pos] == ',') p.pos++;
     }
+    if (p.pos < p.len && p.s[p.pos] == ']') p.pos++;
     expect_char(&p, '}'); expect_char(&p, ',');
 
     /* "merchant": { id, mcc, avg_amount } */
