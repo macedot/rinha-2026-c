@@ -18,13 +18,24 @@ docker compose up -d --build 2>&1 | tail -5
 
 # Wait for ready
 echo "Waiting for /ready..." >&2
+ready=0
 for i in {1..60}; do
-    if curl -sf http://localhost:9999/ready >/dev/null 2>&1; then
+    if curl -sf --max-time 2 http://localhost:9999/ready >/dev/null 2>&1; then
         echo "Ready." >&2
+        ready=1
         break
     fi
     sleep 1
 done
+
+if [[ $ready -eq 0 ]]; then
+    echo "ERROR: server never became ready" >&2
+    echo "--- docker compose ps ---" >&2
+    docker compose ps -a >&2
+    echo "--- docker compose logs ---" >&2
+    docker compose logs >&2
+    exit 1
+fi
 
 # Run k6 test
 echo "Running k6 load test..." >&2

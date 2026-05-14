@@ -11,8 +11,8 @@ const char *score_full[6] = {
 
 const size_t score_len[6] = { 106, 106, 106, 107, 107, 107 };
 
-const char *resp_ready = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-const size_t resp_ready_len = 37;
+const char *resp_ready = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+const size_t resp_ready_len = 40;
 
 const char *resp_not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
 const size_t resp_not_found_len = 46;

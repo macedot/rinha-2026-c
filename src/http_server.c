@@ -124,7 +124,8 @@ static int handle_request(conn_t *c) {
         }
 
         float q[VEC_DIM];
-        if (!vectorizer_build(req_buf + body_start, cl, q)) {
+        int vb = vectorizer_build(req_buf + body_start, cl, q);
+        if (!vb) {
             if (send_all(fd, resp_bad_req, resp_bad_req_len) != 0) return -1;
             c->req_len = 0;
             return 1;
@@ -320,7 +321,7 @@ int server_run(const config_t *cfg) {
                     }
                 }
             } else if (fd == server_fd) {
-                /* Main UDS socket: direct connections (health checks) */
+                /* Main UDS socket: direct connections */
                 while (1) {
                     struct sockaddr client_addr;
                     socklen_t client_len = sizeof(client_addr);
@@ -328,7 +329,6 @@ int server_run(const config_t *cfg) {
                     if (client_fd < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         if (errno == EINTR) continue;
-                        fprintf(stderr, "accept error: %d\n", errno);
                         break;
                     }
 
@@ -347,12 +347,10 @@ int server_run(const config_t *cfg) {
                     }
                 }
             } else if (ctrl_conn_find(fd) >= 0) {
-                /* Ctrl connection: receive FDs via SCM_RIGHTS */
                 while (1) {
                     int client_fd = ctrl_recv_fd(fd);
                     if (client_fd < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        /* EOF or error: close ctrl connection */
                         int idx = ctrl_conn_find(fd);
                         if (idx >= 0) {
                             epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
@@ -367,6 +365,11 @@ int server_run(const config_t *cfg) {
                         continue;
                     }
 
+                    if (set_nonblocking(client_fd) < 0) {
+                        conn_close(c);
+                        continue;
+                    }
+
                     struct epoll_event cev;
                     cev.events = EPOLLIN | EPOLLET;
                     cev.data.ptr = c;
@@ -376,7 +379,6 @@ int server_run(const config_t *cfg) {
                     }
                 }
             } else {
-                /* Client connection: process HTTP */
                 conn_t *c = (conn_t *)events[i].data.ptr;
                 int rc = process_conn(c);
                 if (rc < 0) {
