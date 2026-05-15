@@ -25,7 +25,7 @@ static int env_bool(const char *name, int def) {
 config_t config_load(void) {
     config_t cfg;
     cfg.index_path = env_str("INDEX_PATH", "resources/index.bin");
-    cfg.ivf_nprobe = env_int("IVF_NPROBE", 8, 1, 64);
+    cfg.ivf_nprobe = env_int("IVF_NPROBE", 5, 1, 64);
     cfg.ivf_full_nprobe = env_int("IVF_FULL_NPROBE", 24, 1, 64);
     cfg.candidates = env_int("CANDIDATES", 0, 0, 2000000);
     cfg.uds_path = env_str("UDS_PATH", getenv("SOCKET_PATH") ? getenv("SOCKET_PATH") : "/tmp/rinha.sock");

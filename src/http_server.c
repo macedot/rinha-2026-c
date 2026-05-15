@@ -4,6 +4,7 @@
 #include "vectorizer.h"
 #include "bridge.h"
 #include "scm_rights.h"
+#include "perf.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -16,9 +17,18 @@
 #include <stdlib.h>
 #include <time.h>
 #include <sys/epoll.h>
+#include <sys/poll.h>
+#include <netinet/tcp.h>
+#include <netinet/in.h>
 
-#define REQ_BUF_SIZE 32768
+#define REQ_BUF_SIZE 8192
 #define MAX_EVENTS 128
+
+static inline uint64_t perf_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -27,8 +37,21 @@ static int set_nonblocking(int fd) {
 }
 
 static inline int send_all(int fd, const char *data, size_t len) {
-    ssize_t n = send(fd, data, len, MSG_NOSIGNAL);
-    return (n == (ssize_t)len) ? 0 : -1;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, data + sent, len - sent, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+                poll(&pfd, 1, 1000);
+                continue;
+            }
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+    return 0;
 }
 
 static size_t find_content_length(const char *headers, size_t headers_len) {
@@ -85,7 +108,7 @@ static void conn_close(conn_t *c) {
     c->req_len = 0;
 }
 
-static int handle_request(conn_t *c) {
+static int handle_request(conn_t *c, perf_sample_t *ps) {
     char *req_buf = c->req_buf;
     size_t req_len = c->req_len;
     int fd = c->fd;
@@ -123,6 +146,7 @@ static int handle_request(conn_t *c) {
             return 0;
         }
 
+        uint64_t t_json_start = perf_now();
         float q[VEC_DIM];
         int vb = vectorizer_build(req_buf + body_start, cl, q);
         if (!vb) {
@@ -130,15 +154,25 @@ static int handle_request(conn_t *c) {
             c->req_len = 0;
             return 1;
         }
+        uint64_t t_json_end = perf_now();
+        if (ps) ps->json_ns += t_json_end - t_json_start;
 
+        uint64_t t_knn_start = perf_now();
         int frauds = rinha_search(q);
+        uint64_t t_knn_end = perf_now();
+        if (ps) ps->knn_ns += t_knn_end - t_knn_start;
+
         if (frauds > 5) {
             if (send_all(fd, resp_internal_err, resp_internal_err_len) != 0) return -1;
             c->req_len = 0;
             return 1;
         }
+
+        uint64_t t_send_start = perf_now();
         const char *resp = score_for((uint8_t)frauds);
         if (send_all(fd, resp, score_len[(uint8_t)frauds]) != 0) return -1;
+        uint64_t t_send_end = perf_now();
+        if (ps) ps->send_ns += t_send_end - t_send_start;
 
         size_t consumed = body_start + cl;
         if (req_len > consumed) {
@@ -160,19 +194,64 @@ static int process_conn(conn_t *c) {
     char *req_buf = c->req_buf;
     size_t *req_len = &c->req_len;
 
+    perf_sample_t ps = {0, 0, 0, 0, 0};
+    int did_recv = 0;
+
     while (1) {
-        ssize_t n = recv(fd, req_buf + *req_len, REQ_BUF_SIZE - *req_len, 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        if (*req_len == 0 || did_recv == 0) {
+            uint64_t t_recv_start = perf_now();
+            ssize_t n = recv(fd, req_buf + *req_len, REQ_BUF_SIZE - *req_len, 0);
+            uint64_t t_recv_end = perf_now();
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if (did_recv && ps.total_ns > 0) {
+                        perf_record(&ps);
+                    }
+                    return 0;
+                }
+                if (did_recv && ps.total_ns > 0) {
+                    perf_record(&ps);
+                }
+                return -1;
+            }
+            if (n == 0) {
+                if (did_recv && ps.total_ns > 0) {
+                    perf_record(&ps);
+                }
+                return -1;
+            }
+            *req_len += (size_t)n;
+            ps.recv_ns += t_recv_end - t_recv_start;
+            did_recv = 1;
+        }
+
+        uint64_t t_hdl_start = perf_now();
+        int rc = handle_request(c, &ps);
+        uint64_t t_hdl_end = perf_now();
+
+        if (rc < 0) {
+            if (ps.total_ns > 0) perf_record(&ps);
             return -1;
         }
-        if (n == 0) return -1;
-        *req_len += (size_t)n;
+        if (rc == 0) {
+            if (ps.total_ns > 0) perf_record(&ps);
+            return 0;
+        }
 
-        int rc = handle_request(c);
-        if (rc < 0) return -1;
-        if (rc == 0) return 0;
-        if (rc == 1) return 1;
+        ps.total_ns += t_hdl_end - t_hdl_start;
+
+        if (rc == 2) {
+            did_recv = 0;
+            continue;
+        }
+
+        perf_record(&ps);
+        ps.recv_ns = 0;
+        ps.json_ns = 0;
+        ps.knn_ns = 0;
+        ps.send_ns = 0;
+        ps.total_ns = 0;
+        did_recv = 0;
     }
 }
 

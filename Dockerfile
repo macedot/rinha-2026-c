@@ -18,7 +18,7 @@ COPY --from=build /src/data/index.bin /app/resources/index.bin
 WORKDIR /app
 ENV INDEX_PATH=/app/resources/index.bin
 ENV LISTEN_TCP=0
-ENV IVF_NPROBE=8
+ENV IVF_NPROBE=5
 ENV IVF_FULL_NPROBE=24
 ENV CANDIDATES=0
 
