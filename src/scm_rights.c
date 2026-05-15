@@ -8,6 +8,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <netinet/tcp.h>
+#include <netinet/in.h>
 
 /* Create a .ctrl UDS socket for receiving FDs via SCM_RIGHTS */
 int ctrl_socket_create(const char *base_path) {
@@ -88,6 +90,13 @@ int ctrl_recv_fd(int conn_fd) {
     /* Set non-blocking */
     int flags = fcntl(received_fd, F_GETFL, 0);
     if (flags >= 0) fcntl(received_fd, F_SETFL, flags | O_NONBLOCK);
+
+    /* Set TCP_NODELAY to disable Nagle for small responses */
+    int one = 1;
+    setsockopt(received_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    /* Set TCP_QUICKACK to send ACKs immediately */
+    setsockopt(received_fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 
     return received_fd;
 }

@@ -18,7 +18,7 @@ x-api-common: &api-common
     UDS_PATH: "/run/sock/api.sock"
     UDS_MODE: "666"
     UNLINK_UDS: "1"
-    IVF_NPROBE: "8"
+    IVF_NPROBE: "5"
     IVF_FULL_NPROBE: "24"
     CANDIDATES: "0"
   security_opt:
