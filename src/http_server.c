@@ -2,7 +2,7 @@
 #include "http_server.h"
 #include "http_resp.h"
 #include "vectorizer.h"
-#include "bridge.h"
+#include "knn.h"
 #include "scm_rights.h"
 #include "perf.h"
 
