@@ -17,6 +17,11 @@
 !src/*.c
 !src/*.h
 
+# Allow tests
+!test/
+!test/*.c
+!test/test.js
+
 # Allow resources (reference data, but not the huge index.bin)
 !resources/
 !resources/mcc_risk.json

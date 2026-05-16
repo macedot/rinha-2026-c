@@ -5,9 +5,6 @@
 #include <math.h>
 #include <ctype.h>
 
-static float round4(float x) {
-    return roundf(x * 10000.0f) * 0.0001f;
-}
 
 static float clamp01(float v) {
     if (v < 0.0f) return 0.0f;

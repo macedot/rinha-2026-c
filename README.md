@@ -134,10 +134,10 @@ Score perfeito 6000 (p99=0.23ms, 0 falsos positivos, 0 falsos negativos, 54.100 
 │   ├── http_server.c / .h  # Servidor HTTP epoll + UDS
 │   ├── http_resp.c / .h    # Respostas HTTP pré-computadas
 │   ├── scm_rights.c / .h   # Recebe FDs TCP via SCM_RIGHTS
-│   └── vectorizer.c / .h   # Vetorizador 14-dim + parser JSON inline
-├── bridge/                 # Submódulo git: macedot/rinha-2026-base
-│   └── data/
-│       └── index.bin.gz    # Índice IVF (3M vetores, 4096 clusters)
+│   ├── vectorizer.c / .h   # Vetorizador 14-dim + parser JSON inline
+│   └── knn.c / .h          # Motor de busca KNN (IVF1) com AVX2
+├── resources/
+│   └── index.bin.gz        # Índice IVF (3M vetores, 4096 clusters)
 ├── Dockerfile
 ├── docker-compose.yml
 ├── Makefile

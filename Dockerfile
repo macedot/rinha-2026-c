@@ -6,10 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY Makefile Makefile
 COPY src/ src/
-COPY bridge/ bridge/
 COPY resources/ resources/
 
-RUN mkdir -p data && gzip -dkc bridge/data/index.bin.gz > data/index.bin && make && mkdir -p /app && cp rinha-server /app/server
+RUN mkdir -p data && gzip -dkc resources/index.bin.gz > data/index.bin && make && mkdir -p /app && cp rinha-server /app/server
 
 FROM debian:trixie-slim
 COPY --from=build /app/server /app/server

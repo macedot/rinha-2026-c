@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "config.h"
-#include "bridge.h"
+#include "knn.h"
 #include "http_server.h"
 
 #include <stdio.h>
@@ -53,7 +53,7 @@ int main(void) {
     ts_init();
     config_t cfg = config_load();
 
-    fprintf(stderr, "[%ldms] engine: C/AVX2 bridge implementation\n", ts_ms());
+    fprintf(stderr, "[%ldms] engine: C/AVX2 KNN implementation\n", ts_ms());
 
     maybe_pin_cpu(&cfg);
 
