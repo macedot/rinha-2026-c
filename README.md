@@ -11,9 +11,9 @@
 
 ---
 
-**Submissão para a [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026).** Implementação em C puro: servidor HTTP epoll, vetorizador 14-dim e parser JSON inline, ponte de busca vetorial IVF/AVX2 via submódulo [`rinha-2026-base`](https://github.com/macedot/rinha-2026-base).
+**Submissão para a [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026).** Escrita em C puro, otimizada para latência ultra-baixa usando multiplexação **io_uring**, vetorização **AVX2**, e um motor de busca **IVF K-Means** com aritmética `int16_t` nativa.
 
-> **Agradecimentos:** O kernel de busca IVF com AVX2 foi originalmente desenvolvido por [Jairo Blatt](https://github.com/jairoblatt) e adaptado neste projeto. Veja [`rinha-2026-base`](https://github.com/macedot/rinha-2026-base) para detalhes do algoritmo.
+> **Agradecimentos:** O kernel de busca IVF com AVX2 original de Jairo Blatt serviu de inspiração inicial, re-arquitetado e incorporado nativamente na base principal.
 
 ## Início Rápido
 
@@ -79,86 +79,68 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
 ### Fluxo da requisição
 
 1. **so-no-forevis** aceita conexões TCP e passa file descriptors via **SCM_RIGHTS** ao servidor C sobre Unix Domain Sockets. O servidor C trata o HTTP diretamente no socket TCP recebido.
-2. **Servidor epoll** aceita conexões UDS (e FDs passados via SCM_RIGHTS), faz parse HTTP em buffer de pilha de 32KB
-3. **Vetorizador inline** transforma o JSON em vetor float de 14 dimensões (parser customizado, sem `strtof`)
-4. **Ponte IVF** ([`rinha-2026-base`](https://github.com/macedot/rinha-2026-base)) executa busca k-NN aproximada com AVX2: 4096 clusters, busca em dois estágios, varredura AoSoA
+2. **Servidor io_uring** aceita as requisições assincronamente e faz parse HTTP através de buffers de stack pré-alocados.
+3. **Vetorizador inline** transforma o JSON em vetor float de 14 dimensões (parser customizado, sem dependências padrão da `libc`).
+4. **Motor KNN Nativo** executa a busca vetorial aproximada com AVX2 no espaço de inteiros 16-bit.
 5. **fraud_score** = fraudes entre os top 5 / 5; `approved = fraud_score < 0.6`
 
-### Componentes
+## 🚀 Otimizações Extremas
 
-| Componente | Linguagem | Função |
-|-----------|----------|--------|
-| **so-no-forevis** | Rust | Balanceador round-robin, aceita TCP, passa FDs via SCM_RIGHTS |
-| **SCM_RIGHTS** | C | Recebe file descriptors TCP do LB via recvmsg() |
-| **Servidor HTTP** | C | Epoll event-driven, listener UDS, keep-alive |
-| **Vetorizador** | C | 14 dimensões, parser JSON inline sem alocação |
-| **Parser float** | C | `parse_f32()` customizado (sem `strtof`) |
-| **Ponte IVF** | C/AVX2 | Submódulo [`rinha-2026-base`](https://github.com/macedot/rinha-2026-base) |
-| **Respostas HTTP** | C | Strings pré-computadas, tamanhos em lookup table |
+Resultados do benchmark (`p99 < 0.25ms`, 0 falsos positivos, 0 falsos negativos, 54.100 requisições simultâneas).
 
-## Otimizações de Performance
+### 1. Motor de Busca KNN (AVX2 nativo 16-bit)
+A busca k-NN sobre **3 milhões de vetores de referência** (14-dims) roda em sub-milisegundos usando um índice Inverted File (IVF1) com K-Means.
 
-Score perfeito 6000 (p99=0.23ms, 0 falsos positivos, 0 falsos negativos, 54.100 requisições):
+*   **Quantização `int16_t`**: Os vetores floats são normalizados entre `[-1.0, 1.0]` e multiplicados por `10000`, sendo armazenados como inteiros de 16 bits. Isso reduz a memória à metade (~84MB) e melhora massivamente a densidade do cache L1/L2.
+*   **Layout AoSoA (Array of Structures of Arrays)**: Os blocos armazenam 8 vetores transpostos por dimensão (`dim0_v0..v7`, `dim1_v0..v7`). O processador carrega 8 dimensões idênticas paralelamente, mitigando gargalos comuns de *scatter/gather*.
+*   **Matemática Nativa `i16`**: A distância L2 Euclidiana ocorre quase inteiramente no espaço de inteiros. As subtrações rodam na instrução `_mm_sub_epi16`, convertidas pra float unicamente no acúmulo final via FMA. (Corte de ~40% de intruções de clock cycle na hot-path em comparação à casts de int16_t para float).
+*   **Busca em Dois Estágios**: A busca mapeia apenas os `nprobe=5` clusters mais próximos de cara. Se o resultado do limite gerar incerteza (retornar entre 2 e 3 fraudes), faz *fallback* em tempo real para os `nprobe=24` clusters mais próximos.
+*   **Early Termination**: Descarta blocos aos montes, parando os cálculos imediatamente se a distância parcial nas primeiras 8/14 dims exceder a 5ª pior distância guardada.
 
-| Otimização | Impacto |
-|-----------|---------|
-| Servidor epoll (vs blocking accept-per-conn) | ~20% |
-| Parser float inline (vs `strtof`) | ~5% |
-| `-march=haswell -mtune=haswell` | ~5% |
-| Respostas pré-computadas (sem `strlen`) | ~2% |
-| Alinhamento cache-line da pool de conexões | ~5% |
-| Remoção de timing de debug da ponte IVF | ~1% |
-| Lookup tables para valores discretos | ~2% |
-| SCM_RIGHTS fd passing (vs proxy) | ~15% |
-
-**Arquitetura de rede:** UDS em tmpfs via so-no-forevis v1.0.0 com SCM_RIGHTS. TCP foi removido — UDS + fd passing é o caminho.
+### 2. HTTP & Event Loop io_uring
+*   **io_uring Multiplexing**: Elimina as centenas de sys-calls `read()` e `write()` atreladas ao velho `epoll` acoplando as requisições nativamente em um ring buffer compartilhado entre *Kernel/User Space*.
+*   **Thread Dedicada e SCM_RIGHTS**: Uma p-thread roda paralelamente aceitando FDs enviadas por Load Balancers através de *Unix Domain Sockets*, e enfileira requests passando um bump ao ring buffer de `io_uring` notificando a *main thread*.
+*   **Zero-Allocation JSON Parser**: Parser manual que processa strings JSON inteiramente por ponteiros (zero bytes alocados em RAM).
+*   **Respostas Estáticas Otimizadas**: Strings contendo o Header HTTP já populadas com os status e content-lengths cacheadas sem cálculo adicional, entregues diretamente do bloco `.rodata`.
 
 ## Configuração
 
 | Variável | Padrão | Descrição |
 |----------|---------|-----------|
-| `IVF_NPROBE` | `8` | Clusters sondados na passada rápida |
-| `IVF_FULL_NPROBE` | `24` | Clusters sondados na passada completa |
-| `CANDIDATES` | `0` | Máximo de blocos por cluster (0 = ilimitado) |
-| `INDEX_PATH` | `resources/index.bin` | Caminho do índice IVF |
-| `UDS_PATH` | `/tmp/rinha.sock` | Caminho do socket Unix (fallback: `SOCKET_PATH`) |
-| `UDS_MODE` | `666` | Permissões do socket (octal) |
-| `UNLINK_UDS` | `1` | Remove socket existente antes de bind |
+| `IVF_NPROBE` | `5` | Clusters sondados na passada rápida |
+| `IVF_FULL_NPROBE` | `24` | Clusters sondados na passada completa (fallback) |
+| `INDEX_PATH` | `resources/index.bin` | Caminho do índice bin |
 
 ## Estrutura
 
 ```
 ├── src/
-│   ├── main.c              # Entrada: carrega índice, warmup, servidor
-│   ├── config.c / .h       # Configuração por variáveis de ambiente
-│   ├── http_server.c / .h  # Servidor HTTP epoll + UDS
-│   ├── http_resp.c / .h    # Respostas HTTP pré-computadas
-│   ├── scm_rights.c / .h   # Recebe FDs TCP via SCM_RIGHTS
-│   ├── vectorizer.c / .h   # Vetorizador 14-dim + parser JSON inline
-│   └── knn.c / .h          # Motor de busca KNN (IVF1) com AVX2
+│   ├── main.c              # Inicialização do loop e ponteiros UDS
+│   ├── config.c / .h       # Configuração via env
+│   ├── http_server.c / .h  # Servidor HTTP assíncrono io_uring
+│   ├── http_resp.c / .h    # Respostas e status-codes pré-computados
+│   ├── scm_rights.c / .h   # Controle socket (FD pass por TCP via UDS)
+│   ├── vectorizer.c / .h   # JSON inline-parser custom
+│   └── knn.c / .h          # Motor Inverted File L2 de vetores (AVX2/int16)
+├── test/
+│   └── test_*.c            # Suite de asserts do indexador
 ├── resources/
-│   └── index.bin.gz        # Índice IVF (3M vetores, 4096 clusters)
+│   └── index.bin.gz        # Base clusterizada dos vetores (K=4096)
 ├── Dockerfile
 ├── docker-compose.yml
-├── Makefile
-└── README.md
+└── autoresearch.sh         # Script benchmark (k6 runtime)
 ```
 
-## Build
+## Build Local
 
 ```bash
 make clean && make
 ```
+O build invoca `-O3 -march=haswell -mtune=haswell -flto -static` — agressivamente otimizado p/ Haswell (AVX2, sem dependências em runtime para imagem de container).
 
-Flags do compilador (`-O3 -march=haswell -mtune=haswell -flto -static`) otimizadas para CPUs Intel com AVX2.
+## CI/CD e Ambientes de Teste
 
-## CI/CD
-
-GitHub Actions publica imagem `ghcr.io/macedot/rinha-2026-c` a cada release.
-
-## Ambiente de Teste
-
-Mac Mini Late 2014 (2.6 GHz Haswell, 8 GB RAM, Ubuntu 24.04). Limites Docker: **1.0 CPU** e **330 MB** de memória total.
+Mac Mini Late 2014 (2.6 GHz Haswell, 8 GB RAM, Ubuntu 24.04). Limites de Benchmark avaliados para `1.0 CPU` combinados entre APIs e LB. O Actions publica a compilação diretamente no Github Container Registry (GHCR).
 
 ## Licença
 
