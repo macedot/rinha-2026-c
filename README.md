@@ -56,8 +56,8 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
                            └─────┬────┘
                                  │ HTTP :9999
                           ┌──────▼──────────┐
-                          │ so-no-forevis   │
-                          │ v1.0.0          │
+                          │ haproxy         │
+                          │ (UDS backends)  │
                           │ cpus: 0.2       │
                           │ mem:  30 MB     │
                           └───┬───────┬─────┘
@@ -78,7 +78,7 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
 
 ### Fluxo da requisição
 
-1. **so-no-forevis** aceita conexões TCP e passa file descriptors via **SCM_RIGHTS** ao servidor C sobre Unix Domain Sockets. O servidor C trata o HTTP diretamente no socket TCP recebido.
+1. **HAProxy** load balances to the API instances over Unix Domain Sockets. The C servers accept connections on their UDS sockets (and can still receive raw FDs via the legacy SCM_RIGHTS path if needed). The C server handles HTTP directly on the received sockets.
 2. **Servidor io_uring** aceita as requisições assincronamente e faz parse HTTP através de buffers de stack pré-alocados.
 3. **Vetorizador inline** transforma o JSON em vetor float de 14 dimensões (parser customizado, sem dependências padrão da `libc`).
 4. **Motor KNN Nativo** executa a busca vetorial aproximada com AVX2 no espaço de inteiros 16-bit.
