@@ -8,7 +8,7 @@
     "source-code-repo": "https://github.com/macedot/rinha-2026-c",
     "stack": [
         "c",
-        "so-no-forevis"
+        "haproxy"
     ],
     "open_to_work": false
 }
