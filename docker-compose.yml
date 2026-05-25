@@ -11,8 +11,8 @@ x-api-common: &api-common
   deploy:
     resources:
       limits:
-        cpus: "0.4"
-        memory: "150M"
+        cpus: "0.45"
+        memory: "125M"
   environment: &api-env
     INDEX_PATH: "/app/resources/index.bin"
     UDS_PATH: "/run/sock/api.sock"
@@ -21,11 +21,12 @@ x-api-common: &api-common
     IVF_NPROBE: "5"
     IVF_FULL_NPROBE: "24"
     CANDIDATES: "0"
-  # No security_opt:unconfined - using standard HAProxy + UDS sockets
+  # No security_opt anywhere
 
 services:
   lb:
-    image: haproxy:2.9-alpine
+    build: .
+    entrypoint: ["/app/lb"]
     container_name: rinha-c-lb
     restart: always
     depends_on:
@@ -35,20 +36,21 @@ services:
       - "9999:9999"
     volumes:
       - rinha-c-sock:/run/sock
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    command: ["haproxy", "-f", "/usr/local/etc/haproxy/haproxy.cfg", "-V"]
     networks:
       - rinha-c-net
+    environment:
+      - LB_PORT=9999
+      - LB_BACKENDS=/run/sock/api1.sock.ctrl,/run/sock/api2.sock.ctrl
     deploy:
       resources:
         limits:
-          cpus: "0.2"
+          cpus: "0.1"
           memory: "30M"
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
-    # No security_opt required - official HAProxy image + UDS backends
+    # Custom lightweight SCM_RIGHTS load balancer - no external images, no security_opt required
 
   api1:
     <<: *api-common
@@ -56,6 +58,7 @@ services:
     environment:
       <<: *api-env
       UDS_PATH: "/run/sock/api1.sock"
+    cpuset: "0"   # CPU pinning (Phase 1)
 
   api2:
     <<: *api-common
@@ -63,6 +66,7 @@ services:
     environment:
       <<: *api-env
       UDS_PATH: "/run/sock/api2.sock"
+    cpuset: "1"   # CPU pinning (Phase 1)
 
 networks:
   rinha-c-net:
