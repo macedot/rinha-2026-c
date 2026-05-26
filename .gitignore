@@ -9,7 +9,6 @@
 !docker-compose.yml
 !haproxy.cfg
 !info.json
-!autoresearch.sh
 !README.md
 
 # Allow source code
@@ -22,22 +21,11 @@
 !indexer/*.c
 !indexer/Makefile
 
-# Allow tests
-!test/
-!test/*.c
-!test/test.js
-
-# Allow resources (reference data, but not the huge index.bin)
+# Allow resources (reference data)
 !resources/
 !resources/mcc_risk.json
+!resources/normalization.json
 !resources/references.json.gz
-!resources/example-payloads.json
-!resources/example-references.json
-resources/index.bin
-
-# Allow data (pre-built index)
-!data/
-!data/*.bin
 
 # Allow CI
 !.github/

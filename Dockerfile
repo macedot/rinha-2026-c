@@ -23,9 +23,3 @@ WORKDIR /app
 ENV INDEX_PATH=/app/data
 
 ENTRYPOINT ["/app/server"]
-
-FROM debian:trixie-slim AS lb
-COPY --from=build /src/lb /app/lb
-
-WORKDIR /app
-ENTRYPOINT ["/app/lb"]

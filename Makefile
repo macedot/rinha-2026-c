@@ -6,18 +6,14 @@ LDFLAGS = -static -flto -s -lm
 
 SRCS = src/main.c src/config.c src/knn.c src/http_server.c src/http_resp.c src/vectorizer.c src/scm_rights.c src/perf.c
 TARGET = rinha-server
-LB_TARGET = lb
 INDEXER = indexer/indexer
 INPUT_FILE ?= resources/example-references.json
 DATA_DIR = data
 
-all: $(TARGET) $(LB_TARGET)
+all: $(TARGET)
 
 $(TARGET): $(SRCS) src/knn.h src/config.h src/http_server.h src/http_resp.h src/vectorizer.h src/perf.h
 	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
-
-$(LB_TARGET): src/lb.c
-	$(CC) $(CFLAGS) -o $@ src/lb.c $(LDFLAGS)
 
 $(INDEXER): indexer/indexer.c
 	$(MAKE) -C indexer
@@ -27,9 +23,8 @@ index: $(INDEXER)
 	$(INDEXER) $(INPUT_FILE) $(DATA_DIR)
 
 clean:
-	rm -f $(TARGET) $(LB_TARGET)
+	rm -f $(TARGET)
 	$(MAKE) -C indexer clean
 	rm -rf $(DATA_DIR)
 
 .PHONY: all clean index
-
