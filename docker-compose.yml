@@ -1,5 +1,7 @@
 x-api-common: &api-common
-  build: .
+  build:
+    context: .
+    target: server
   volumes:
     - rinha-c-sock:/run/sock
   networks:
@@ -21,7 +23,9 @@ x-api-common: &api-common
 
 services:
   lb:
-    build: .
+    build:
+      context: .
+      target: lb
     entrypoint: ["/app/lb"]
     container_name: rinha-c-lb
     restart: always

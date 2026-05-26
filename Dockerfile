@@ -9,12 +9,17 @@ COPY src/ src/
 
 RUN make
 
-FROM debian:trixie-slim
+FROM debian:trixie-slim AS server
 COPY --from=build /src/rinha-server /app/server
-COPY --from=build /src/lb /app/lb
-COPY data/ /app/data/
+COPY data/*.bin /app/data/
 
 WORKDIR /app
 ENV INDEX_PATH=/app/data
 
 ENTRYPOINT ["/app/server"]
+
+FROM debian:trixie-slim AS lb
+COPY --from=build /src/lb /app/lb
+
+WORKDIR /app
+ENTRYPOINT ["/app/lb"]
