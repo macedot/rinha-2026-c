@@ -1,5 +1,5 @@
 x-api-common: &api-common
-  image: ghcr.io/macedot/rinha-2026-c:v0.3.1
+  image: ghcr.io/macedot/rinha-2026-c:0.3.1
   volumes:
     - rinha-c-sock:/run/sock
   networks:
