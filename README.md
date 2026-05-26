@@ -7,12 +7,12 @@
   <img src="https://img.shields.io/badge/C-11-00599C?logo=c&logoColor=white" alt="C" />
   <img src="https://img.shields.io/badge/AVX2-FMA-4ade80" alt="AVX2+FMA" />
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker" />
-  <img src="https://img.shields.io/badge/LB-SCM__RIGHTS-0094C2" alt="SCM_RIGHTS LB" />
+  <img src="https://img.shields.io/badge/LB-HAProxy-0094C2?logo=haproxy&logoColor=white" alt="HAProxy" />
 </p>
 
 ---
 
-**Submissão para a [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026).** Escrita em C puro, otimizada para latência ultra-baixa usando um motor de busca **HIVF K-Means** de 2 níveis com distância Manhattan e AVX2, servida atrás de um **load balancer customizado SCM_RIGHTS** sem nenhum `security_opt`.
+**Submissão para a [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026).** Escrita em C puro, otimizada para latência ultra-baixa usando um motor de busca **HIVF K-Means** de 2 níveis com distância Manhattan e AVX2, servida atrás de **HAProxy** sem nenhum `security_opt`.
 
 ## Agradecimentos
 
@@ -62,9 +62,9 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
                            └─────┬────┘
                                  │ HTTP :9999
                           ┌──────▼──────────┐
-                          │   lb (SCM_RIGHTS)│
+                          │   HAProxy       │
                           │ (UDS backends)  │
-                          │ cpus: 0.1       │
+                          │ cpus: 0.2       │
                           │ mem:  30 MB     │
                           └───┬───────┬─────┘
                               │       │
@@ -84,12 +84,14 @@ Retorna `200 OK` quando o índice foi carregado e a API está pronta.
 
 ### Fluxo da requisição
 
-1. **lb** (load balancer SCM_RIGHTS customizado) recebe conexões TCP na porta 9999 e encaminha via sockets Unix Domain para uma das duas instâncias da API.
+1. **HAProxy** recebe conexões TCP na porta 9999 e encaminha via sockets Unix Domain para uma das duas instâncias da API.
 2. O servidor C aceita a conexão no UDS, faz parse HTTP e vetoriza o payload.
 3. **Motor KNN Nativo (AVX2)** executa a busca vetorial aproximada em 3 estágios.
 4. **fraud_score** = soma ponderada de fraudes no K=7 / K; `approved = fraud_score < 0.44`.
 
 Não é mais utilizado `security_opt: seccomp:unconfined` em nenhum serviço.
+
+> **Nota sobre arquivos removidos**: Em versões anteriores existiam `lb.c` (load balancer customizado), `test/` (testes unitários), `autoresearch.sh` (script de benchmark local) e arquivos de exemplo (`example-payloads.json`, `example-references.json`). Foram removidos para manter o repositório enxuto — apenas o código essencial permanece.
 
 ## Motor de Busca (o mais importante)
 
@@ -132,18 +134,23 @@ Principais variáveis de ambiente:
 
 ```
 ├── src/
-│   ├── main.c, config.*, http_server.*, http_resp.*, knn.c, vectorizer.c, scm_rights.c, perf.c
+│   ├── main.c            # Ponto de entrada
+│   ├── config.c/h        # Configuração por variáveis de ambiente
+│   ├── http_server.c/h   # Servidor HTTP sobre Unix Domain Socket
+│   ├── http_resp.c/h     # Formatação de respostas JSON
+│   ├── knn.c/h           # Motor de busca HIVF com AVX2
+│   ├── vectorizer.c/h    # Extração de features 16-dim
+│   ├── scm_rights.c/h    # Controle de socket Unix Domain
+│   └── perf.c/h          # Medição de latência
 ├── indexer/
-│   ├── indexer.c       # HIVF 2-level K-Means indexer
+│   ├── indexer.c         # Indexador HIVF 2-level K-Means
 │   └── Makefile
 ├── resources/
-│   ├── references.json.gz  # Base de dados de referência
-│   ├── normalization.json  # Pesos de features usados no build
-│   └── index.bin.gz        # Índice binário (gerado no build)
-├── test/
-│   ├── test.js, test-heavy.js, test-data.json
-├── lb.c                 # Custom SCM_RIGHTS load balancer
+│   ├── references.json.gz    # Base de dados de referência (3M registros)
+│   ├── normalization.json    # Pesos de features
+│   └── mcc_risk.json         # Tabela de risco por MCC
 ├── docker-compose.yml
+├── haproxy.cfg
 ├── Dockerfile
 └── Makefile
 ```
@@ -151,14 +158,19 @@ Principais variáveis de ambiente:
 ## Build Local
 
 ```bash
-# Gera o índice e compila
-make clean && make index && make
-
-# Ou via Docker
+# Compilação e execução completa via Docker
 docker compose up --build
 ```
 
-Compilado com `-O3 -march=haswell -mtune=haswell -flto -static`.
+O `Dockerfile` compila tudo automaticamente: o indexador gera o índice HIVF a partir de `resources/references.json.gz` (3M registros) e o servidor C é compilado com `-O3 -march=haswell -flto -static`.
+
+Para build manual:
+```bash
+make indexer/indexer        # Compila o indexador
+indexer/indexer resources/references.json.gz data   # Gera o índice
+make                        # Compila o servidor
+./rinha-server              # Executa
+```
 
 ## Licença
 
