@@ -5,648 +5,330 @@
 #include <stdio.h>
 #include <math.h>
 #include <float.h>
-#include <time.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-static inline uint64_t get_nanos(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
+#define DIM 16
+#define K_NEIGHBORS 7
+#define N_L1 256
+#define N_L2_PER_L1 256
+#define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
+#define N_PROBE_L1 16
+#define N_PROBE_L2 256
+#define N_PROBE_L2_EXTENDED 512
+#define APPROVAL_THRESHOLD 0.44f
+#define CONFIDENCE_LOW 0.38f
+#define CONFIDENCE_HIGH 0.50f
+#define EARLY_EXIT_DIST 0.05f
+#define MAX_DIST_TRIGGER 1.5f
 
-static uint64_t g_time_quant = 0;
-static uint64_t g_time_centroid = 0;
-static uint64_t g_time_topn = 0;
-static uint64_t g_time_reorder = 0;
-static uint64_t g_time_fast = 0;
-static uint64_t g_time_full = 0;
-static uint64_t g_inst_count = 0;
+static const float FEATURE_WEIGHTS[DIM] = {
+    1.0038165f, 0.665417f, 0.8668326f, 0.5379362f, 0.5f, 0.3f, 0.3701757f,
+    1.0f, 1.2f, 1.2648705f, 0.81239825f, 1.051987f, 0.8247206f, 2.0315619f,
+    0.0f, 0.0f
+};
 
-#define BRIDGE_REPORT_INTERVAL 1000
+/* --- Index data (mmap'd) --- */
 
-static void bridge_report(void) {
-    uint64_t cnt = g_inst_count;
-    if (cnt == 0) return;
-    fprintf(stderr, "[KNN] N=%lu quant=%.3f centroid=%.3f topn=%.3f reorder=%.3f fast=%.3f full=%.3f (avg us)\n",
-        (unsigned long)cnt,
-        (double)g_time_quant / (double)cnt / 1000.0,
-        (double)g_time_centroid / (double)cnt / 1000.0,
-        (double)g_time_topn / (double)cnt / 1000.0,
-        (double)g_time_reorder / (double)cnt / 1000.0,
-        (double)g_time_fast / (double)cnt / 1000.0,
-        (double)g_time_full / (double)cnt / 1000.0);
-    g_time_quant = 0;
-    g_time_centroid = 0;
-    g_time_topn = 0;
-    g_time_reorder = 0;
-    g_time_fast = 0;
-    g_time_full = 0;
-    g_inst_count = 0;
-}
-
-void rinha_get_inst(uint64_t out[7]) {
-    out[0] = g_time_quant;
-    out[1] = g_time_centroid;
-    out[2] = g_time_topn;
-    out[3] = g_time_reorder;
-    out[4] = g_time_fast;
-    out[5] = g_time_full;
-    out[6] = g_inst_count;
-}
-
-void rinha_reset_inst(void) {
-    g_time_quant = 0;
-    g_time_centroid = 0;
-    g_time_topn = 0;
-    g_time_reorder = 0;
-    g_time_fast = 0;
-    g_time_full = 0;
-    g_inst_count = 0;
-}
-
-#define DIM 14
-#define K_NEIGHBORS 5
-#define FIX_SCALE 10000.0f
-#define VECTOR_SCALE (1.0f / FIX_SCALE)
-#define IVF_CLUSTERS 4096
-#define IVF_MAX_NPROBE 64
-#define CACHELINE 64
-#define BLOCK_STRIDE 112  /* 8 slots * 14 dims */
-
-#if defined(__GNUC__) || defined(__clang__)
-#define likely(x)   __builtin_expect(!!(x), 1)
-#define unlikely(x) __builtin_expect(!!(x), 0)
-#else
-#define likely(x)   (x)
-#define unlikely(x) (x)
-#endif
-
-static inline void *xaligned_alloc(size_t alignment, size_t size) {
-    void *ptr = NULL;
-    if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
-    memset(ptr, 0, size);
-    return ptr;
-}
-
-static inline int16_t quantize_fixed(float x) {
-    if (x < -1.0f) x = -1.0f;
-    if (x >  1.0f) x =  1.0f;
-    float scaled = x * FIX_SCALE;
-    scaled += scaled >= 0.0f ? 0.5f : -0.5f;
-    if (scaled < -10000.0f) scaled = -10000.0f;
-    if (scaled >  10000.0f) scaled =  10000.0f;
-    return (int16_t)scaled;
-}
-
-/* Dataset: IVF1 AoSoA layout
- *
- * centroids_t[dim][cluster]: float, transposed column-major (dim-major)
- *   - centroid distance reads dim0 of all clusters contiguously, then dim1, etc.
- * block_offsets[K+1]: cumulative block counts per cluster
- * labels[total_blocks * 8]: padded to block boundaries
- * blocks[total_blocks * BLOCK_STRIDE]: AoSoA
- *   - each block: dim0[0..7], dim1[0..7], ..., dim13[0..7] = 112 i16
- */
 typedef struct {
-    int n;
-    int total_blocks;
-    float *centroids_t;       /* [DIM * IVF_CLUSTERS], transposed, align(32) */
-    uint32_t block_offsets[IVF_CLUSTERS + 1];
-    uint8_t *labels;          /* [total_blocks * 8], padded */
-    int16_t *blocks;          /* [total_blocks * BLOCK_STRIDE], AoSoA, align(32) */
-} dataset_t;
+    float *l1_centroids;
+    float *l2_centroids;
+    uint32_t *offsets;
+    float *dataset;
+    int n_records;
+    void *l1_mmap, *l2_mmap, *off_mmap, *ds_mmap;
+    size_t l1_size, l2_size, off_size, ds_size;
+} hivf_t;
 
-static dataset_t g_dataset;
-static int g_nprobe = 8;
-static int g_full_nprobe = 24;
-static int g_candidates = 0;
+static hivf_t g_index;
+static int g_loaded = 0;
 
-static int read_exact(FILE *f, void *ptr, size_t len) {
-    return fread(ptr, 1, len, f) == len ? 0 : -1;
+static void *mmap_file(const char *path, size_t *size_out) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { perror(path); return NULL; }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return NULL; }
+    size_t sz = st.st_size;
+    if (sz == 0) { close(fd); return NULL; }
+    void *addr = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (addr == MAP_FAILED) return NULL;
+    madvise(addr, sz, MADV_RANDOM);
+    *size_out = sz;
+    return addr;
 }
 
 int rinha_load_index(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { perror(path); return -1; }
+    char fp[1024];
 
-    char magic[4];
-    uint32_t n = 0, k = 0, d = 0;
-    if (read_exact(f, magic, 4) != 0 || memcmp(magic, "IVF1", 4) != 0 ||
-        read_exact(f, &n, sizeof(n)) != 0 ||
-        read_exact(f, &k, sizeof(k)) != 0 ||
-        read_exact(f, &d, sizeof(d)) != 0) {
-        fprintf(stderr, "index invalido ou magic != IVF1: %s\n", path);
-        fclose(f); return -1;
-    }
+    snprintf(fp, sizeof(fp), "%s/l1_centroids.bin", path);
+    g_index.l1_mmap = mmap_file(fp, &g_index.l1_size);
+    if (!g_index.l1_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+    g_index.l1_centroids = (float *)g_index.l1_mmap;
 
-    if (k != IVF_CLUSTERS || d != DIM) {
-        fprintf(stderr, "index incompativel: K=%u D=%u\n", k, d);
-        fclose(f); return -1;
-    }
+    snprintf(fp, sizeof(fp), "%s/l2_centroids.bin", path);
+    g_index.l2_mmap = mmap_file(fp, &g_index.l2_size);
+    if (!g_index.l2_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+    g_index.l2_centroids = (float *)g_index.l2_mmap;
 
-    memset(&g_dataset, 0, sizeof(g_dataset));
-    g_dataset.n = (int)n;
+    snprintf(fp, sizeof(fp), "%s/offsets.bin", path);
+    g_index.off_mmap = mmap_file(fp, &g_index.off_size);
+    if (!g_index.off_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+    g_index.offsets = (uint32_t *)g_index.off_mmap;
 
-    /* Transposed centroids: DIM * IVF_CLUSTERS floats, align(32) */
-    g_dataset.centroids_t = (float *)xaligned_alloc(32,
-        (size_t)DIM * IVF_CLUSTERS * sizeof(float));
-    if (!g_dataset.centroids_t) { fclose(f); return -1; }
-    if (read_exact(f, g_dataset.centroids_t,
-        (size_t)DIM * IVF_CLUSTERS * sizeof(float)) != 0) {
-        fclose(f); return -1;
-    }
+    snprintf(fp, sizeof(fp), "%s/dataset.bin", path);
+    g_index.ds_mmap = mmap_file(fp, &g_index.ds_size);
+    if (!g_index.ds_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+    g_index.dataset = (float *)g_index.ds_mmap;
+    g_index.n_records = (int)(g_index.ds_size / (DIM * sizeof(float)));
 
-    /* Block offsets: K+1 uint32 */
-    if (read_exact(f, g_dataset.block_offsets,
-        (size_t)(IVF_CLUSTERS + 1) * sizeof(uint32_t)) != 0) {
-        fclose(f); return -1;
-    }
-    g_dataset.total_blocks = (int)g_dataset.block_offsets[IVF_CLUSTERS];
-    int padded_n = g_dataset.total_blocks * 8;
-
-    /* Labels: padded_n uint8 */
-    g_dataset.labels = (uint8_t *)xaligned_alloc(CACHELINE,
-        (size_t)padded_n * sizeof(uint8_t));
-    if (!g_dataset.labels) { fclose(f); return -1; }
-    if (read_exact(f, g_dataset.labels, (size_t)padded_n) != 0) {
-        fclose(f); return -1;
-    }
-
-    /* Blocks: total_blocks * BLOCK_STRIDE int16, align(32) */
-    g_dataset.blocks = (int16_t *)xaligned_alloc(32,
-        (size_t)g_dataset.total_blocks * BLOCK_STRIDE * sizeof(int16_t));
-    if (!g_dataset.blocks) { fclose(f); return -1; }
-    if (read_exact(f, g_dataset.blocks,
-        (size_t)g_dataset.total_blocks * BLOCK_STRIDE * sizeof(int16_t)) != 0) {
-        fclose(f); return -1;
-    }
-
-    fclose(f);
-
-    double mb = ((double)g_dataset.total_blocks * BLOCK_STRIDE * sizeof(int16_t) +
-                 (double)padded_n +
-                 (double)DIM * IVF_CLUSTERS * sizeof(float) +
-                 (double)(IVF_CLUSTERS + 1) * sizeof(uint32_t)) / (1024.0 * 1024.0);
-    fprintf(stderr, "index IVF1 carregado: N=%u K=%u blocks=%d memoria=%.2f MB\n",
-        n, k, g_dataset.total_blocks, mb);
-#ifdef __AVX2__
-    fprintf(stderr, "KNN engine: AVX2 enabled (AoSoA blocks + centroid dist)\n");
-#else
-    fprintf(stderr, "KNN engine: scalar fallback\n");
-#endif
+    g_loaded = 1;
+    fprintf(stderr, "HIVF loaded: %d records, L1=%d L2=%d offsets=%zu\n",
+            g_index.n_records, N_L1, N_TOTAL_L2, g_index.off_size / sizeof(uint32_t));
     return 0;
 }
 
 void rinha_set_search_params(int nprobe, int full_nprobe, int candidates) {
-    g_nprobe = nprobe;
-    g_full_nprobe = full_nprobe;
-    g_candidates = candidates;
+    (void)nprobe; (void)full_nprobe; (void)candidates;
 }
 
-/* --- Top-5 maintenance --- */
+/* --- Top-K heap (K=7) --- */
 
-static inline int worst_index5_f(const float d[5]) {
-    int w = 0;
-    if (d[1] > d[w]) w = 1;
-    if (d[2] > d[w]) w = 2;
-    if (d[3] > d[w]) w = 3;
-    if (d[4] > d[w]) w = 4;
-    return w;
-}
+typedef struct {
+    float dist;
+    uint8_t label;
+} topk_t;
 
-static inline void try_insert_top5_f(float d, uint8_t label,
-                                     float best_d[5], uint8_t best_l[5],
-                                     float *worst_d) {
-    if (d < *worst_d) {
-        int pos = 4;
-        while (pos > 0 && d < best_d[pos - 1]) pos--;
-        for (int i = 4; i > pos; i--) {
-            best_d[i] = best_d[i - 1];
-            best_l[i] = best_l[i - 1];
-        }
-        best_d[pos] = d;
-        best_l[pos] = label;
-        *worst_d = best_d[4];
+static inline void topk_insert(topk_t *tk, int k, float dist, uint8_t label) {
+    if (dist >= tk[k - 1].dist) return;
+    int pos = k - 1;
+    while (pos > 0 && dist < tk[pos - 1].dist) {
+        tk[pos] = tk[pos - 1];
+        pos--;
     }
+    tk[pos].dist = dist;
+    tk[pos].label = label;
 }
 
-/* --- Centroid distance: scalar fallback --- */
+static inline uint8_t unpack_label(float packed) {
+    uint32_t bits;
+    memcpy(&bits, &packed, sizeof(uint32_t));
+    return (uint8_t)(bits & 1u);
+}
 
-static inline float centroid_sqdist_scalar(const float q[DIM], int c) {
-    float s = 0.0f;
-    for (int j = 0; j < DIM; j++) {
-        float d = q[j] - g_dataset.centroids_t[(size_t)j * IVF_CLUSTERS + c];
-        s += d * d;
+/* --- Distance kernels --- */
+
+static inline float manhattan_scalar(const float a[DIM], const float b[DIM]) {
+    float sum = 0.0f;
+    for (int i = 0; i < 14; i++) {
+        sum += fabsf(a[i] - b[i]);
     }
-    return s;
+    return sum;
 }
-
-static inline void insert_probe_cluster(int cluster, float penalty,
-                                        int *best_c, float *best_p, int nprobe) {
-    if (penalty >= best_p[nprobe - 1]) return;
-    int pos = nprobe - 1;
-    while (pos > 0 && penalty < best_p[pos - 1]) pos--;
-    for (int i = nprobe - 1; i > pos; i--) {
-        best_p[i] = best_p[i - 1];
-        best_c[i] = best_c[i - 1];
-    }
-    best_p[pos] = penalty;
-    best_c[pos] = cluster;
-}
-
-/* --- AVX2 centroid distance (process 16 centroids per iter) --- */
 
 #ifdef __AVX2__
 #include <immintrin.h>
 
-static void compute_centroid_dists_avx2(const float q[DIM], float dists[IVF_CLUSTERS]) {
-    const float *cp = g_dataset.centroids_t;
-    float *dp = dists;
-    const int k = IVF_CLUSTERS;
-
-    /* Dim 0: initialize squared differences */
-    {
-        __m256 qd = _mm256_set1_ps(q[0]);
-        int ci = 0;
-        while (ci + 16 <= k) {
-            __m256 c0 = _mm256_loadu_ps(cp + ci);
-            __m256 c1 = _mm256_loadu_ps(cp + ci + 8);
-            __m256 d0 = _mm256_sub_ps(c0, qd);
-            __m256 d1 = _mm256_sub_ps(c1, qd);
-            _mm256_storeu_ps(dp + ci, _mm256_mul_ps(d0, d0));
-            _mm256_storeu_ps(dp + ci + 8, _mm256_mul_ps(d1, d1));
-            ci += 16;
-        }
-        while (ci + 8 <= k) {
-            __m256 c0 = _mm256_loadu_ps(cp + ci);
-            __m256 d0 = _mm256_sub_ps(c0, qd);
-            _mm256_storeu_ps(dp + ci, _mm256_mul_ps(d0, d0));
-            ci += 8;
-        }
-        while (ci < k) {
-            float diff = cp[ci] - q[0];
-            dp[ci] = diff * diff;
-            ci++;
-        }
-    }
-
-    /* Dims 1..13: accumulate with FMA */
-    for (int d = 1; d < DIM; d++) {
-        size_t base = (size_t)d * k;
-        __m256 qd = _mm256_set1_ps(q[d]);
-        int ci = 0;
-        while (ci + 16 <= k) {
-            __m256 cv0 = _mm256_loadu_ps(cp + base + ci);
-            __m256 cv1 = _mm256_loadu_ps(cp + base + ci + 8);
-            __m256 d0 = _mm256_sub_ps(cv0, qd);
-            __m256 d1 = _mm256_sub_ps(cv1, qd);
-            __m256 a0 = _mm256_loadu_ps(dp + ci);
-            __m256 a1 = _mm256_loadu_ps(dp + ci + 8);
-            _mm256_storeu_ps(dp + ci, _mm256_fmadd_ps(d0, d0, a0));
-            _mm256_storeu_ps(dp + ci + 8, _mm256_fmadd_ps(d1, d1, a1));
-            ci += 16;
-        }
-        while (ci + 8 <= k) {
-            __m256 cv = _mm256_loadu_ps(cp + base + ci);
-            __m256 d0 = _mm256_sub_ps(cv, qd);
-            __m256 a0 = _mm256_loadu_ps(dp + ci);
-            _mm256_storeu_ps(dp + ci, _mm256_fmadd_ps(d0, d0, a0));
-            ci += 8;
-        }
-        while (ci < k) {
-            float diff = cp[base + ci] - q[d];
-            dp[ci] += diff * diff;
-            ci++;
-        }
-    }
+static inline float hsum_ps(__m128 v) {
+    v = _mm_hadd_ps(v, v);
+    v = _mm_hadd_ps(v, v);
+    return _mm_cvtss_f32(v);
 }
 
-static void top_n_from_dists_avx2(int nprobe, const float dists[IVF_CLUSTERS],
-                                  int best_c[IVF_MAX_NPROBE], float best_p[IVF_MAX_NPROBE]) {
-    for (int i = 0; i < nprobe; i++) {
-        best_c[i] = -1;
-        best_p[i] = FLT_MAX;
-    }
+static inline float manhattan_avx2(const float a[DIM], const float b[DIM]) {
+    __m256 q0 = _mm256_loadu_ps(a);
+    __m256 q1 = _mm256_loadu_ps(a + 8);
+    __m256 c0 = _mm256_loadu_ps(b);
+    __m256 c1 = _mm256_loadu_ps(b + 8);
+    __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    __m256 d0 = _mm256_and_ps(_mm256_sub_ps(q0, c0), absm);
+    __m256 d1 = _mm256_and_ps(_mm256_sub_ps(q1, c1), absm);
+    __m256 s = _mm256_add_ps(d0, d1);
+    __m128 lo = _mm256_castps256_ps128(s);
+    __m128 hi = _mm256_extractf128_ps(s, 1);
+    return hsum_ps(_mm_add_ps(lo, hi));
+}
 
-    int ci = 0;
-    while (ci + 8 <= IVF_CLUSTERS) {
-        __m256 d8 = _mm256_loadu_ps(dists + ci);
-        __m256 threshold = _mm256_set1_ps(best_p[nprobe - 1]);
-        int mask = _mm256_movemask_ps(_mm256_cmp_ps(d8, threshold, _CMP_LT_OQ));
-        if (mask != 0) {
-            float buf[8];
-            _mm256_storeu_ps(buf, d8);
-            int m = mask;
-            while (m != 0) {
-                int s = __builtin_ctz(m);
-                m &= m - 1;
-                float di = buf[s];
-                if (di < best_p[nprobe - 1]) {
-                    int pos = nprobe - 1;
-                    while (pos > 0 && di < best_p[pos - 1]) pos--;
-                    for (int i = nprobe - 1; i > pos; i--) {
-                        best_p[i] = best_p[i - 1];
-                        best_c[i] = best_c[i - 1];
-                    }
-                    best_p[pos] = di;
-                    best_c[pos] = ci + s;
-                }
-            }
-        }
-        ci += 8;
-    }
-
-    while (ci < IVF_CLUSTERS) {
-        float di = dists[ci];
-        if (di < best_p[nprobe - 1]) {
-            int pos = nprobe - 1;
-            while (pos > 0 && di < best_p[pos - 1]) pos--;
-            for (int i = nprobe - 1; i > pos; i--) {
-                best_p[i] = best_p[i - 1];
-                best_c[i] = best_c[i - 1];
-            }
-            best_p[pos] = di;
-            best_c[pos] = ci;
-        }
-        ci++;
+static inline void manhattan_avx2_x4(const float q[DIM],
+                                     const float *r0, const float *r1,
+                                     const float *r2, const float *r3,
+                                     float out[4]) {
+    __m256 q0 = _mm256_loadu_ps(q);
+    __m256 q1 = _mm256_loadu_ps(q + 8);
+    __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const float *rr[4] = {r0, r1, r2, r3};
+    for (int i = 0; i < 4; i++) {
+        __m256 c0 = _mm256_loadu_ps(rr[i]);
+        __m256 c1 = _mm256_loadu_ps(rr[i] + 8);
+        __m256 d0 = _mm256_and_ps(_mm256_sub_ps(q0, c0), absm);
+        __m256 d1 = _mm256_and_ps(_mm256_sub_ps(q1, c1), absm);
+        __m256 s = _mm256_add_ps(d0, d1);
+        __m128 lo = _mm256_castps256_ps128(s);
+        __m128 hi = _mm256_extractf128_ps(s, 1);
+        out[i] = hsum_ps(_mm_add_ps(lo, hi));
     }
 }
 #endif
 
-#ifndef __AVX2__
-static void compute_centroid_dists_scalar(const float q[DIM], float dists[IVF_CLUSTERS]) {
-    for (int c = 0; c < IVF_CLUSTERS; c++) {
-        dists[c] = centroid_sqdist_scalar(q, c);
-    }
+/* --- Top-N selection helpers --- */
+
+typedef struct { float dist; int idx; } dist_idx_t;
+
+static int cmp_dist_asc(const void *a, const void *b) {
+    float da = ((const dist_idx_t *)a)->dist;
+    float db = ((const dist_idx_t *)b)->dist;
+    return (da < db) ? -1 : (da > db) ? 1 : 0;
 }
 
-static void top_n_from_dists_scalar(int nprobe, const float dists[IVF_CLUSTERS],
-                                    int best_c[IVF_MAX_NPROBE], float best_p[IVF_MAX_NPROBE]) {
-    for (int i = 0; i < nprobe; i++) {
-        best_c[i] = -1;
-        best_p[i] = FLT_MAX;
-    }
-    for (int c = 0; c < IVF_CLUSTERS; c++) {
-        insert_probe_cluster(c, dists[c], best_c, best_p, nprobe);
-    }
-}
-#endif
+/* --- Scan cluster records --- */
 
-/* --- AoSoA block-based scan kernels --- */
+static inline float scan_cluster(int l2_idx, const float q[DIM],
+                                  topk_t *topk, float max_dist) {
+    uint32_t start = g_index.offsets[l2_idx];
+    uint32_t end = g_index.offsets[l2_idx + 1];
+    if (end <= start) return max_dist;
 
-static inline void scan_blocks_scalar(int start_block, int end_block, const int16_t q[DIM],
-                                      float best_d[5], uint8_t best_l[5],
-                                      float *worst_d) {
-    const int16_t *blocks = g_dataset.blocks;
-    const uint8_t *labels = g_dataset.labels;
-
-    for (int bi = start_block; bi < end_block; bi++) {
-        const int16_t *b = blocks + (size_t)bi * BLOCK_STRIDE;
-        const uint8_t *lb = labels + (size_t)bi * 8;
-
-        for (int slot = 0; slot < 8; slot++) {
-            if (b[slot] == INT16_MAX) continue;
-
-            float dist = 0.0f;
-            for (int j = 0; j < DIM; j++) {
-                int32_t diff = (int32_t)b[(size_t)j * 8 + slot] - (int32_t)q[j];
-                dist += (float)(diff * diff);
-            }
-            dist *= (VECTOR_SCALE * VECTOR_SCALE);
-            
-            if (dist < *worst_d) {
-                try_insert_top5_f(dist, lb[slot], best_d, best_l, worst_d);
-            }
-        }
-    }
-}
+    const float *records = g_index.dataset + (size_t)start * DIM;
+    int n = (int)(end - start);
 
 #ifdef __AVX2__
-
-static void scan_blocks_avx2(int start_block, int end_block, const int16_t q[DIM],
-                             float best_d[5], uint8_t best_l[5],
-                             float *worst_d) {
-    const int16_t *blocks = g_dataset.blocks;
-    const uint8_t *labels = g_dataset.labels;
-    const __m256 sq_scale = _mm256_set1_ps(VECTOR_SCALE * VECTOR_SCALE);
-
-    const __m128i qv0  = _mm_set1_epi16(q[0]);
-    const __m128i qv1  = _mm_set1_epi16(q[1]);
-    const __m128i qv2  = _mm_set1_epi16(q[2]);
-    const __m128i qv3  = _mm_set1_epi16(q[3]);
-    const __m128i qv4  = _mm_set1_epi16(q[4]);
-    const __m128i qv5  = _mm_set1_epi16(q[5]);
-    const __m128i qv6  = _mm_set1_epi16(q[6]);
-    const __m128i qv7  = _mm_set1_epi16(q[7]);
-    const __m128i qv8  = _mm_set1_epi16(q[8]);
-    const __m128i qv9  = _mm_set1_epi16(q[9]);
-    const __m128i qv10 = _mm_set1_epi16(q[10]);
-    const __m128i qv11 = _mm_set1_epi16(q[11]);
-    const __m128i qv12 = _mm_set1_epi16(q[12]);
-    const __m128i qv13 = _mm_set1_epi16(q[13]);
-
-    float dists_buf[8] __attribute__((aligned(32)));
-
-    for (int bi = start_block; bi < end_block; bi++) {
-        int pf_block = bi + 8;
-        if (pf_block < end_block) {
-            _mm_prefetch((const char *)(blocks + (size_t)pf_block * BLOCK_STRIDE),
-                         _MM_HINT_T0);
-            _mm_prefetch((const char *)(blocks + (size_t)pf_block * BLOCK_STRIDE + 56),
-                         _MM_HINT_T0);
-        }
-
-        size_t bb = (size_t)bi * BLOCK_STRIDE;
-        const uint8_t *lb = labels + (size_t)bi * 8;
-        __m256 threshold = _mm256_set1_ps(*worst_d);
-
-        __m256 acc0 = _mm256_setzero_ps();
-        __m256 acc1 = _mm256_setzero_ps();
-
-        /* Pair (0,1) */
-        { __m128i r0 = _mm_loadu_si128((const __m128i *)(blocks + bb + 0));
-          __m128i r1 = _mm_loadu_si128((const __m128i *)(blocks + bb + 8));
-          __m256 d0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r0, qv0)));
-          __m256 d1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r1, qv1)));
-          acc0 = _mm256_fmadd_ps(d0, d0, acc0);
-          acc1 = _mm256_fmadd_ps(d1, d1, acc1); }
-
-        /* Pair (2,3) */
-        { __m128i r0 = _mm_loadu_si128((const __m128i *)(blocks + bb + 16));
-          __m128i r1 = _mm_loadu_si128((const __m128i *)(blocks + bb + 24));
-          __m256 d0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r0, qv2)));
-          __m256 d1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r1, qv3)));
-          acc0 = _mm256_fmadd_ps(d0, d0, acc0);
-          acc1 = _mm256_fmadd_ps(d1, d1, acc1); }
-
-        /* Pair (4,5) */
-        { __m128i r0 = _mm_loadu_si128((const __m128i *)(blocks + bb + 32));
-          __m128i r1 = _mm_loadu_si128((const __m128i *)(blocks + bb + 40));
-          __m256 d0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r0, qv4)));
-          __m256 d1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r1, qv5)));
-          acc0 = _mm256_fmadd_ps(d0, d0, acc0);
-          acc1 = _mm256_fmadd_ps(d1, d1, acc1); }
-
-        /* Pair (6,7) */
-        { __m128i r0 = _mm_loadu_si128((const __m128i *)(blocks + bb + 48));
-          __m128i r1 = _mm_loadu_si128((const __m128i *)(blocks + bb + 56));
-          __m256 d0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r0, qv6)));
-          __m256 d1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r1, qv7)));
-          acc0 = _mm256_fmadd_ps(d0, d0, acc0);
-          acc1 = _mm256_fmadd_ps(d1, d1, acc1); }
-
-        /* Early termination */
-        __m256 partial = _mm256_mul_ps(_mm256_add_ps(acc0, acc1), sq_scale);
-        if (_mm256_movemask_ps(_mm256_cmp_ps(partial, threshold, _CMP_LT_OQ)) == 0)
-            continue;
-
-        /* Pair (8,9) */
-        { __m128i r0 = _mm_loadu_si128((const __m128i *)(blocks + bb + 64));
-          __m128i r1 = _mm_loadu_si128((const __m128i *)(blocks + bb + 72));
-          __m256 d0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r0, qv8)));
-          __m256 d1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r1, qv9)));
-          acc0 = _mm256_fmadd_ps(d0, d0, acc0);
-          acc1 = _mm256_fmadd_ps(d1, d1, acc1); }
-
-        /* Pair (10,11) */
-        { __m128i r0 = _mm_loadu_si128((const __m128i *)(blocks + bb + 80));
-          __m128i r1 = _mm_loadu_si128((const __m128i *)(blocks + bb + 88));
-          __m256 d0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r0, qv10)));
-          __m256 d1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r1, qv11)));
-          acc0 = _mm256_fmadd_ps(d0, d0, acc0);
-          acc1 = _mm256_fmadd_ps(d1, d1, acc1); }
-
-        /* Pair (12,13) */
-        { __m128i r0 = _mm_loadu_si128((const __m128i *)(blocks + bb + 96));
-          __m128i r1 = _mm_loadu_si128((const __m128i *)(blocks + bb + 104));
-          __m256 d0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r0, qv12)));
-          __m256 d1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_sub_epi16(r1, qv13)));
-          acc0 = _mm256_fmadd_ps(d0, d0, acc0);
-          acc1 = _mm256_fmadd_ps(d1, d1, acc1); }
-
-        __m256 acc = _mm256_mul_ps(_mm256_add_ps(acc0, acc1), sq_scale);
-        int mask = _mm256_movemask_ps(_mm256_cmp_ps(acc, threshold, _CMP_LT_OQ));
-        if (mask == 0) continue;
-
-        _mm256_store_ps(dists_buf, acc);
-        int m = mask;
-        while (m != 0) {
-            int slot = __builtin_ctz(m);
-            m &= m - 1;
-            float di = dists_buf[slot];
-            if (di < *worst_d) {
-                try_insert_top5_f(di, lb[slot], best_d, best_l, worst_d);
+    int i = 0;
+    while (i + 3 < n) {
+        float dists[4];
+        manhattan_avx2_x4(q,
+            records + (size_t)i * DIM,
+            records + (size_t)(i + 1) * DIM,
+            records + (size_t)(i + 2) * DIM,
+            records + (size_t)(i + 3) * DIM,
+            dists);
+        for (int j = 0; j < 4; j++) {
+            if (dists[j] < max_dist) {
+                uint8_t lbl = unpack_label(records[(size_t)(i + j) * DIM + 15]);
+                topk_insert(topk, K_NEIGHBORS, dists[j], lbl);
+                max_dist = topk[K_NEIGHBORS - 1].dist;
             }
         }
+        i += 4;
     }
-}
-#endif
-
-static inline void scan_blocks(int start_block, int end_block, const int16_t q[DIM],
-                               float best_d[5], uint8_t best_l[5],
-                               float *worst_d) {
-#ifdef __AVX2__
-    scan_blocks_avx2(start_block, end_block, q, best_d, best_l, worst_d);
+    while (i < n) {
+        float d = manhattan_avx2(q, records + (size_t)i * DIM);
+        if (d < max_dist) {
+            uint8_t lbl = unpack_label(records[(size_t)i * DIM + 15]);
+            topk_insert(topk, K_NEIGHBORS, d, lbl);
+            max_dist = topk[K_NEIGHBORS - 1].dist;
+        }
+        i++;
+    }
 #else
-    scan_blocks_scalar(start_block, end_block, q, best_d, best_l, worst_d);
-#endif
-}
-
-/* --- Search with nprobe (block-based) --- */
-
-static inline int count_frauds5(const uint8_t best_l[5]) {
-    return (best_l[0] == 1) + (best_l[1] == 1) + (best_l[2] == 1) +
-           (best_l[3] == 1) + (best_l[4] == 1);
-}
-
-static int search_with_nprobe(int nprobe_to_use, const int best_c[],
-                              const int16_t q[DIM]) {
-    int nprobe = nprobe_to_use;
-    if (nprobe > IVF_CLUSTERS) nprobe = IVF_CLUSTERS;
-    if (nprobe < 1) nprobe = 1;
-
-    float best_d[5] = { INFINITY, INFINITY, INFINITY, INFINITY, INFINITY };
-    uint8_t best_l[5] = {0, 0, 0, 0, 0};
-    float worst_d = INFINITY;
-
-    for (int pi = 0; pi < nprobe; pi++) {
-        int c = best_c[pi];
-        if (c < 0) continue;
-        int start_block = (int)g_dataset.block_offsets[c];
-        int end_block   = (int)g_dataset.block_offsets[c + 1];
-        if (end_block <= start_block) continue;
-
-        int nblocks = end_block - start_block;
-        if (g_candidates > 0) {
-            int max_blocks = (g_candidates + 7) / 8;
-            if (nblocks > max_blocks) nblocks = max_blocks;
-            end_block = start_block + nblocks;
+    for (int i = 0; i < n; i++) {
+        float d = manhattan_scalar(q, records + (size_t)i * DIM);
+        if (d < max_dist) {
+            uint8_t lbl = unpack_label(records[(size_t)i * DIM + 15]);
+            topk_insert(topk, K_NEIGHBORS, d, lbl);
+            max_dist = topk[K_NEIGHBORS - 1].dist;
         }
+    }
+#endif
+    return max_dist;
+}
 
-        /* Prefetch first blocks of next cluster while we scan this one */
-        if (pi + 1 < nprobe) {
-            int next_c = best_c[pi + 1];
-            if (next_c >= 0) {
-                int nb = (int)g_dataset.block_offsets[next_c];
-                for (int pfi = 0; pfi < 4 && nb + pfi < (int)g_dataset.block_offsets[next_c + 1]; pfi++) {
-                    size_t pbb = (size_t)(nb + pfi) * BLOCK_STRIDE;
-                    _mm_prefetch((const char *)(g_dataset.blocks + pbb), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(g_dataset.blocks + pbb + 56), _MM_HINT_T0);
-                }
+/* --- Compute fraud score from top-k --- */
+
+static inline int calculate_score(topk_t *topk, float *score_out) {
+    if (topk[0].dist < EARLY_EXIT_DIST) {
+        *score_out = topk[0].label ? 1.0f : 0.0f;
+        return topk[0].label == 0;
+    }
+
+    float fraud_weight = 0.0f;
+    float total_weight = 0.0f;
+    for (int i = 0; i < K_NEIGHBORS; i++) {
+        if (topk[i].dist >= 1e20f) continue;
+        float w = expf(-topk[i].dist * 0.5f);
+        total_weight += w;
+        fraud_weight += w * topk[i].label;
+    }
+    float score = (total_weight > 0.0f) ? (fraud_weight / total_weight) : 0.0f;
+    *score_out = score;
+    return score < APPROVAL_THRESHOLD;
+}
+
+/* --- Main search --- */
+
+int rinha_search(const float q_in[DIM], float *fraud_score_out) {
+    if (!g_loaded || !fraud_score_out) return 0;
+
+    // Apply feature weights to query
+    float q[DIM];
+    for (int i = 0; i < 14; i++) q[i] = q_in[i] * FEATURE_WEIGHTS[i];
+    q[14] = 0.0f; q[15] = 0.0f;
+
+    // 1. Compute L1 distances
+    dist_idx_t l1_dists[N_L1];
+    for (int i = 0; i < N_L1; i++) {
+        l1_dists[i].dist = manhattan_scalar(q, g_index.l1_centroids + (size_t)i * DIM);
+        l1_dists[i].idx = i;
+    }
+    qsort(l1_dists, N_L1, sizeof(dist_idx_t), cmp_dist_asc);
+
+    // 2. Compute L2 distances for top L1 clusters
+    dist_idx_t l2_dists[N_PROBE_L1 * N_L2_PER_L1];
+    int l2_count = 0;
+    for (int pi = 0; pi < N_PROBE_L1; pi++) {
+        int l1_idx = l1_dists[pi].idx;
+        int base = l1_idx * N_L2_PER_L1;
+        for (int j = 0; j < N_L2_PER_L1; j++) {
+            l2_dists[l2_count].dist = manhattan_scalar(q, g_index.l2_centroids + (size_t)(base + j) * DIM);
+            l2_dists[l2_count].idx = base + j;
+            l2_count++;
+        }
+    }
+
+    // 3. Select top 512 L2 clusters, sort top 256
+    qsort(l2_dists, l2_count, sizeof(dist_idx_t), cmp_dist_asc);
+
+    // 4. Scan records in top 256 L2 clusters
+    topk_t topk[K_NEIGHBORS];
+    for (int i = 0; i < K_NEIGHBORS; i++) {
+        topk[i].dist = FLT_MAX;
+        topk[i].label = 0;
+    }
+    float max_dist = FLT_MAX;
+
+    for (int pi = 0; pi < N_PROBE_L2; pi++) {
+        max_dist = scan_cluster(l2_dists[pi].idx, q, topk, max_dist);
+        if (topk[0].dist < EARLY_EXIT_DIST) {
+            int approved = calculate_score(topk, fraud_score_out);
+            return approved;
+        }
+    }
+
+    float score;
+    int approved = calculate_score(topk, &score);
+
+    // 5. Adaptive extended probing
+    if ((score > CONFIDENCE_LOW && score < CONFIDENCE_HIGH) || topk[0].dist > MAX_DIST_TRIGGER) {
+        for (int pi = N_PROBE_L2; pi < N_PROBE_L2_EXTENDED && pi < l2_count; pi++) {
+            max_dist = scan_cluster(l2_dists[pi].idx, q, topk, max_dist);
+            if (topk[0].dist < EARLY_EXIT_DIST) {
+                approved = calculate_score(topk, &score);
+                break;
             }
         }
-
-        scan_blocks(start_block, end_block, q, best_d, best_l, &worst_d);
+        approved = calculate_score(topk, &score);
     }
 
-    return count_frauds5(best_l);
+    *fraud_score_out = score;
+    return approved;
 }
 
-int rinha_search(const float q_float[DIM]) {
-    int16_t q[DIM];
-    float q_grid[DIM];
-    for (int j = 0; j < DIM; j++) {
-        q[j] = quantize_fixed(q_float[j]);
-        q_grid[j] = (float)q[j] / FIX_SCALE;
-    }
+/* --- Instrumentation stubs --- */
 
-    int fast_nprobe = g_nprobe;
-    if (fast_nprobe < 1) fast_nprobe = 1;
-    if (fast_nprobe > IVF_MAX_NPROBE) fast_nprobe = IVF_MAX_NPROBE;
-    if (fast_nprobe > IVF_CLUSTERS) fast_nprobe = IVF_CLUSTERS;
+void rinha_get_inst(uint64_t out[7]) {
+    (void)out;
+}
 
-    int full_nprobe = g_full_nprobe;
-    if (full_nprobe < fast_nprobe) full_nprobe = fast_nprobe;
-    if (full_nprobe > IVF_MAX_NPROBE) full_nprobe = IVF_MAX_NPROBE;
-    if (full_nprobe > IVF_CLUSTERS) full_nprobe = IVF_CLUSTERS;
-
-    /* Compute ALL centroid distances — AVX2 vectorized */
-    float dists[IVF_CLUSTERS];
-#ifdef __AVX2__
-    compute_centroid_dists_avx2(q_grid, dists);
-#else
-    compute_centroid_dists_scalar(q_grid, dists);
-#endif
-
-    /* Keep top full_nprobe clusters */
-    int best_c[IVF_MAX_NPROBE];
-    float best_p[IVF_MAX_NPROBE];
-#ifdef __AVX2__
-    top_n_from_dists_avx2(full_nprobe, dists, best_c, best_p);
-#else
-    top_n_from_dists_scalar(full_nprobe, dists, best_c, best_p);
-#endif
-
-    /* Fast pass */
-    int result = search_with_nprobe(fast_nprobe, best_c, q);
-
-    /* Two-stage: if ambiguous (2 or 3 frauds), re-run with full probes */
-    if (result == 2 || result == 3) {
-        result = search_with_nprobe(full_nprobe, best_c, q);
-    }
-
-    if (g_inst_count % BRIDGE_REPORT_INTERVAL == 0) {
-        bridge_report();
-    }
-
-    return result;
+void rinha_reset_inst(void) {
 }

@@ -11,8 +11,7 @@ int main(int argc, char **argv) {
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     char *data = malloc(sz + 1); fread(data, 1, sz, f); data[sz] = 0; fclose(f);
 
-    if (rinha_load_index("resources/index.bin") != 0) { fprintf(stderr, "failed to load index\n"); return 1; }
-    rinha_set_search_params(8, 24, 0);
+    if (rinha_load_index("indexer/test_output") != 0) { fprintf(stderr, "failed to load index\n"); return 1; }
 
     char *p = data;
     while (*p && *p != '[') p++;
@@ -29,11 +28,12 @@ int main(int argc, char **argv) {
             p++;
         }
         size_t len = p - start;
-        float q[14];
+        float q[16];
         int ok = vectorizer_build(start, len, q);
         if (!ok) { printf("[%d] PARSE FAILED\n", idx); continue; }
-        int votes = rinha_search(q);
-        printf("[%d] votes=%d\n", idx, votes);
+        float fraud_score;
+        int approved = rinha_search(q, &fraud_score);
+        printf("[%d] approved=%d fraud_score=%.1f\n", idx, approved, fraud_score);
         while (*p && (*p == ' ' || *p == '\n' || *p == ',')) p++;
     }
     free(data);

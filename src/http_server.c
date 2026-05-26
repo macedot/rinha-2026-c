@@ -158,19 +158,15 @@ static int handle_request(conn_t *c, perf_sample_t *ps) {
         if (ps) ps->json_ns += t_json_end - t_json_start;
 
         uint64_t t_knn_start = perf_now();
-        int frauds = rinha_search(q);
+        float fraud_score = 0.0f;
+        int approved = rinha_search(q, &fraud_score);
         uint64_t t_knn_end = perf_now();
         if (ps) ps->knn_ns += t_knn_end - t_knn_start;
 
-        if (frauds > 5) {
-            if (send_all(fd, resp_internal_err, resp_internal_err_len) != 0) return -1;
-            c->req_len = 0;
-            return 1;
-        }
-
         uint64_t t_send_start = perf_now();
-        const char *resp = score_for((uint8_t)frauds);
-        if (send_all(fd, resp, score_len[(uint8_t)frauds]) != 0) return -1;
+        char resp_buf[256];
+        int resp_len = format_score_response(resp_buf, sizeof(resp_buf), approved, fraud_score);
+        if (send_all(fd, resp_buf, (size_t)resp_len) != 0) return -1;
         uint64_t t_send_end = perf_now();
         if (ps) ps->send_ns += t_send_end - t_send_start;
 

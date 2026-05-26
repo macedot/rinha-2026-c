@@ -38,12 +38,12 @@ int main(int argc, char **argv) {
         }
         size_t len = p - start;
 
-        float q[14];
+        float q[16];
         int ok = vectorizer_build(start, len, q);
         if (!ok) { printf("[%d] PARSE FAILED\n", idx); continue; }
 
         printf("[%d] ", idx);
-        for (int j = 0; j < 14; j++) {
+        for (int j = 0; j < 16; j++) {
             if (j > 0) printf(", ");
             printf("%.6f", q[j]);
         }
