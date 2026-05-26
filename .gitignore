@@ -35,10 +35,9 @@
 !resources/example-references.json
 resources/index.bin
 
-# Allow data (only compressed index)
+# Allow data (pre-built index)
 !data/
-!data/*.bin.gz
-data/*.bin
+!data/*.bin
 
 # Allow CI
 !.github/
