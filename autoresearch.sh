@@ -11,12 +11,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Build index if missing
-if [[ ! -f data/dataset.bin ]]; then
-    echo "Building HIVF index (this may take a while)..." >&2
-    make index INPUT_FILE=resources/references.json.gz
-fi
-
 # Build and start
 echo "Starting docker compose..." >&2
 
