@@ -1,5 +1,5 @@
 x-api-common: &api-common
-  build: .
+  image: ghcr.io/macedot/rinha-2026-c:latest
   volumes:
     - rinha-c-sock:/run/sock
   networks:
@@ -18,11 +18,10 @@ x-api-common: &api-common
     UDS_PATH: "/run/sock/api.sock"
     UDS_MODE: "666"
     UNLINK_UDS: "1"
-  # No security_opt anywhere
 
 services:
   lb:
-    build: .
+    image: ghcr.io/macedot/rinha-2026-c:latest
     entrypoint: ["/app/lb"]
     container_name: rinha-c-lb
     restart: always
@@ -47,7 +46,6 @@ services:
       nofile:
         soft: 65535
         hard: 65535
-    # Custom lightweight SCM_RIGHTS load balancer - no external images, no security_opt required
 
   api1:
     <<: *api-common
@@ -55,7 +53,7 @@ services:
     environment:
       <<: *api-env
       UDS_PATH: "/run/sock/api1.sock"
-    cpuset: "0"   # CPU pinning (Phase 1)
+    cpuset: "0"
 
   api2:
     <<: *api-common
@@ -63,7 +61,7 @@ services:
     environment:
       <<: *api-env
       UDS_PATH: "/run/sock/api2.sock"
-    cpuset: "1"   # CPU pinning (Phase 1)
+    cpuset: "1"
 
 networks:
   rinha-c-net:
