@@ -13,7 +13,7 @@ COPY test/ test/
 ARG INPUT_FILE=resources/references.json.gz
 RUN mkdir -p data && \
     make indexer/indexer && \
-    indexer/indexer $(INPUT_FILE) data && \
+    indexer/indexer $INPUT_FILE data && \
     make && \
     mkdir -p /app && \
     cp rinha-server lb /app/
