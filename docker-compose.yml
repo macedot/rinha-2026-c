@@ -1,0 +1,76 @@
+x-api-common: &api-common
+  image: ghcr.io/macedot/rinha-2026-c:v0.3.0
+  volumes:
+    - rinha-c-sock:/run/sock
+  networks:
+    - rinha-c-net
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  deploy:
+    resources:
+      limits:
+        cpus: "0.45"
+        memory: "125M"
+  environment: &api-env
+    INDEX_PATH: "/app/data"
+    UDS_PATH: "/run/sock/api.sock"
+    UDS_MODE: "666"
+    UNLINK_UDS: "1"
+
+services:
+  lb:
+    image: ghcr.io/macedot/rinha-2026-c:v0.3.0
+    entrypoint: ["/app/lb"]
+    container_name: rinha-c-lb
+    restart: always
+    depends_on:
+      - api1
+      - api2
+    ports:
+      - "9999:9999"
+    volumes:
+      - rinha-c-sock:/run/sock
+    networks:
+      - rinha-c-net
+    environment:
+      - LB_PORT=9999
+      - LB_BACKENDS=/run/sock/api1.sock.ctrl,/run/sock/api2.sock.ctrl
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: "30M"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+  api1:
+    <<: *api-common
+    container_name: rinha-c-api1
+    environment:
+      <<: *api-env
+      UDS_PATH: "/run/sock/api1.sock"
+    cpuset: "0"
+
+  api2:
+    <<: *api-common
+    container_name: rinha-c-api2
+    environment:
+      <<: *api-env
+      UDS_PATH: "/run/sock/api2.sock"
+    cpuset: "1"
+
+networks:
+  rinha-c-net:
+    driver: bridge
+
+volumes:
+  rinha-c-sock:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=10m
