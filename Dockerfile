@@ -17,6 +17,7 @@ RUN make indexer/indexer && \
 FROM debian:trixie-slim AS server
 COPY --from=build /src/rinha-server /app/server
 COPY --from=build /src/data /app/data
+COPY --from=build /src/resources/references.json.gz /app/data/references.json.gz
 
 WORKDIR /app
 ENV INDEX_PATH=/app/data
