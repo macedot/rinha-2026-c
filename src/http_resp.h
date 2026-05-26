@@ -19,4 +19,6 @@ static inline const char *score_for(uint8_t fraud_count) {
     return score_full[fraud_count > 5 ? 0 : fraud_count];
 }
 
+int format_score_response(char *buf, size_t buflen, int approved, float fraud_score);
+
 #endif

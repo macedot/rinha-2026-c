@@ -69,12 +69,13 @@ int main(void) {
     {
         uint32_t state = 0x12345678;
         for (int i = 0; i < 500; i++) {
-            float q[14];
-            for (int j = 0; j < 14; j++) {
+            float q[16];
+            for (int j = 0; j < 16; j++) {
                 state = state * 1664525 + 1013904223;
                 q[j] = (float)(state >> 8) / (float)(1u << 24);
             }
-            rinha_search(q);
+            float fs;
+            rinha_search(q, &fs);
         }
     }
     fprintf(stderr, "[%ldms] cache warmup done\n", ts_ms());

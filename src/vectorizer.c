@@ -5,30 +5,82 @@
 #include <math.h>
 #include <ctype.h>
 
+/* Normalization constants (match Rust normalization.json) */
+static const float MAX_AMOUNT = 10000.0f;
+static const float MAX_INSTALLMENTS = 12.0f;
+static const float MAX_AVG_RATIO = 10.0f;
+static const float MAX_MINUTES = 1440.0f;
+static const float MAX_KM = 1000.0f;
+static const float MAX_TX_COUNT = 20.0f;
+static const float MAX_MERCHANT_AVG = 10000.0f;
 
-static float clamp01(float v) {
+/* MCC risk lookup table (65536 entries, initialized once) */
+static float mcc_risks[65536];
+static int mcc_initialized = 0;
+
+static void init_mcc_risks(void) {
+    if (mcc_initialized) return;
+    for (int i = 0; i < 65536; i++) mcc_risks[i] = 0.5f;
+    mcc_risks[5411] = 0.15f;
+    mcc_risks[5812] = 0.30f;
+    mcc_risks[5912] = 0.20f;
+    mcc_risks[5944] = 0.45f;
+    mcc_risks[7801] = 0.80f;
+    mcc_risks[7802] = 0.75f;
+    mcc_risks[7995] = 0.85f;
+    mcc_risks[4511] = 0.35f;
+    mcc_risks[5311] = 0.25f;
+    mcc_risks[5999] = 0.50f;
+    mcc_initialized = 1;
+}
+
+static inline float clamp01(float v) {
     if (v < 0.0f) return 0.0f;
     if (v > 1.0f) return 1.0f;
     return v;
 }
 
-static float mcc_risk_f(unsigned mcc) {
-    switch (mcc) {
-        case 5411: return 0.15f;
-        case 5812: return 0.30f;
-        case 5912: return 0.20f;
-        case 5944: return 0.45f;
-        case 7801: return 0.80f;
-        case 7802: return 0.75f;
-        case 7995: return 0.85f;
-        case 4511: return 0.35f;
-        case 5311: return 0.25f;
-        case 5999: return 0.50f;
-        default:   return 0.50f;
-    }
+/* --- Timestamp parsing (match Rust logic exactly) --- */
+
+static inline int parse_iso_hour(const char *s, size_t len) {
+    if (len < 13) return 0;
+    int h = (s[11] - '0') * 10 + (s[12] - '0');
+    return h;
 }
 
-/* --- Single-pass JSON parser (no backtracking) --- */
+static inline int parse_iso_dow(const char *s, size_t len) {
+    if (len < 10) return 0;
+    int year = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+    int month = (s[5]-'0')*10 + (s[6]-'0');
+    int day = (s[8]-'0')*10 + (s[9]-'0');
+
+    if (month < 1 || month > 12) return 0;
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    int y = year;
+    if (month < 3) y -= 1;
+    int dow = (y + y/4 - y/100 + y/400 + t[month-1] + day) % 7;
+    // Convert Sunday=0 to Monday=0
+    return (dow == 0) ? 6 : (dow - 1);
+}
+
+static inline int64_t iso_to_epoch_minutes(const char *s, size_t len) {
+    if (len < 16) return 0;
+    int year = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+    int month = (s[5]-'0')*10 + (s[6]-'0');
+    int day = (s[8]-'0')*10 + (s[9]-'0');
+    int hour = (s[11]-'0')*10 + (s[12]-'0');
+    int min = (s[14]-'0')*10 + (s[15]-'0');
+
+    // Simplified (matches Rust indexer)
+    int64_t total_days = (int64_t)(year - 2000) * 365 + (int64_t)(year - 2000) / 4;
+    static const int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    for (int i = 0; i < month - 1; i++) total_days += month_days[i];
+    if (month > 2 && year % 4 == 0) total_days += 1;
+    total_days += day;
+    return total_days * 1440 + hour * 60 + min;
+}
+
+/* --- Single-pass JSON parser (unchanged logic) --- */
 
 typedef struct {
     const char *s;
@@ -108,51 +160,8 @@ static inline void parse_string_bounds(parser_t *p, const char **start, size_t *
     }
 }
 
-static inline unsigned iso_hour(const char *s, size_t len) {
-    if (len < 13) return 0;
-    unsigned h = (unsigned)(s[11] - '0') * 10 + (unsigned)(s[12] - '0');
-    return h > 23 ? 23 : h;
-}
-
-static inline void iso_ymdhm(const char *s, size_t len,
-                             int *y, unsigned *m, unsigned *d,
-                             unsigned *h, unsigned *mi) {
-    *y = 0; *m = 1; *d = 1; *h = 0; *mi = 0;
-    if (len < 16) return;
-    *y = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
-    *m = (unsigned)(s[5]-'0')*10 + (unsigned)(s[6]-'0');
-    *d = (unsigned)(s[8]-'0')*10 + (unsigned)(s[9]-'0');
-    *h = (unsigned)(s[11]-'0')*10 + (unsigned)(s[12]-'0');
-    *mi = (unsigned)(s[14]-'0')*10 + (unsigned)(s[15]-'0');
-}
-
-static int64_t days_from_civil(int y, unsigned m, unsigned d) {
-    if (m <= 2) y -= 1;
-    int era = (y >= 0) ? y / 400 : (y - 399) / 400;
-    unsigned yoe = (unsigned)(y - era * 400);
-    unsigned doy = (m > 2)
-        ? (153 * (m - 3) + 2) / 5 + d - 1
-        : (153 * (m + 9) + 2) / 5 + d - 1;
-    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return (int64_t)era * 146097 + (int64_t)doe - 719468;
-}
-
-static inline size_t weekday_from_iso(const char *s, size_t len) {
-    int y; unsigned m, d, h, mi;
-    iso_ymdhm(s, len, &y, &m, &d, &h, &mi);
-    int64_t days = days_from_civil(y, m, d);
-    int64_t w = ((days + 3) % 7 + 7) % 7;
-    return (size_t)w;
-}
-
-static inline int64_t iso_to_epoch_minutes(const char *s, size_t len) {
-    int y; unsigned m, d, h, mi;
-    iso_ymdhm(s, len, &y, &m, &d, &h, &mi);
-    int64_t days = days_from_civil(y, m, d);
-    return days * 1440 + (int64_t)h * 60 + (int64_t)mi;
-}
-
 int vectorizer_build(const char *body, size_t body_len, float out[VEC_DIM]) {
+    init_mcc_risks();
     memset(out, 0, VEC_DIM * sizeof(float));
 
     parser_t p = { body, body_len, 0 };
@@ -182,7 +191,7 @@ int vectorizer_build(const char *body, size_t body_len, float out[VEC_DIM]) {
         const char *m_start; size_t m_len;
         size_t prev = p.pos;
         parse_string_bounds(&p, &m_start, &m_len);
-        if (p.pos == prev) break; /* no progress — malformed input */
+        if (p.pos == prev) break;
         if (num_merchants < 32) {
             merchants[num_merchants] = m_start;
             merchant_lens[num_merchants] = m_len;
@@ -217,21 +226,17 @@ int vectorizer_build(const char *body, size_t body_len, float out[VEC_DIM]) {
 
     /* "last_transaction": null or { timestamp, km_from_current } */
     skip_string(&p); expect_char(&p, ':');
-    float minutes_since_last_tx = -1.0f;
+    int has_last_tx = 0;
+    const char *last_ts = NULL; size_t last_ts_len = 0;
     float km_from_current = -1.0f;
     skip_ws(&p);
     if (p.pos < p.len && p.s[p.pos] == 'n') {
         p.pos += 4;
     } else {
+        has_last_tx = 1;
         expect_char(&p, '{');
-        skip_string(&p); expect_char(&p, ':'); const char *last_ts; size_t last_ts_len; parse_string_bounds(&p, &last_ts, &last_ts_len); expect_char(&p, ',');
+        skip_string(&p); expect_char(&p, ':'); parse_string_bounds(&p, &last_ts, &last_ts_len); expect_char(&p, ',');
         skip_string(&p); expect_char(&p, ':'); km_from_current = parse_f32(&p); expect_char(&p, '}');
-        int64_t req_mins = iso_to_epoch_minutes(req_ts, req_ts_len);
-        int64_t last_mins = iso_to_epoch_minutes(last_ts, last_ts_len);
-        int64_t diff = req_mins - last_mins;
-        if (diff < 0) diff = -diff;
-        minutes_since_last_tx = clamp01((float)diff / 1440.0f);
-        km_from_current = clamp01(km_from_current / 1000.0f);
     }
 
     /* Parse MCC */
@@ -241,24 +246,68 @@ int vectorizer_build(const char *body, size_t body_len, float out[VEC_DIM]) {
             mcc = mcc * 10 + (unsigned)(mcc_str[i] - '0');
     }
 
-    float ratio = (customer_avg_amount > 0.0f)
-        ? (amount / customer_avg_amount) / 10.0f
-        : 1.0f;
+    /* --- Compute new 16-dim feature vector (matches Rust) --- */
 
-    out[0]  = clamp01(amount / 10000.0f);
-    out[1]  = clamp01(installments / 12.0f);
-    out[2]  = clamp01(ratio);
-    out[3]  = clamp01((float)iso_hour(req_ts, req_ts_len) / 23.0f);
-    out[4]  = clamp01((float)weekday_from_iso(req_ts, req_ts_len) / 6.0f);
-    out[5]  = minutes_since_last_tx;
-    out[6]  = km_from_current;
-    out[7]  = clamp01(km_from_home / 1000.0f);
-    out[8]  = clamp01(tx_count_24h / 20.0f);
-    out[9]  = is_online ? 1.0f : 0.0f;
-    out[10] = card_present ? 1.0f : 0.0f;
-    out[11] = known_merchant ? 0.0f : 1.0f;
-    out[12] = mcc_risk_f(mcc);
-    out[13] = clamp01(merchant_avg_amount / 10000.0f);
+    // 0. ln(1 + amount) / ln(1 + max_amount)
+    out[0] = logf(1.0f + amount) / logf(1.0f + MAX_AMOUNT);
+
+    // 1. installments / max_installments
+    out[1] = clamp01(installments / MAX_INSTALLMENTS);
+
+    // 2. amount_vs_avg_ratio
+    float ratio = (customer_avg_amount > 0.0f)
+        ? (amount / customer_avg_amount) / MAX_AVG_RATIO
+        : 1.0f;
+    out[2] = clamp01(ratio);
+
+    // 3. hour_sin, 4. hour_cos
+    int hour = parse_iso_hour(req_ts, req_ts_len);
+    int dow = parse_iso_dow(req_ts, req_ts_len);
+    float hour_rad = hour * 2.0f * (float)M_PI / 24.0f;
+    float day_rad = dow * 2.0f * (float)M_PI / 7.0f;
+    out[3] = sinf(hour_rad);
+    out[4] = cosf(hour_rad);
+
+    // 5. day_sin, 6. day_cos
+    out[5] = sinf(day_rad);
+    out[6] = cosf(day_rad);
+
+    // 7. ln(1 + minutes) / ln(1 + max_minutes)
+    // 8. km_from_last_tx
+    if (has_last_tx) {
+        int64_t req_mins = iso_to_epoch_minutes(req_ts, req_ts_len);
+        int64_t last_mins = iso_to_epoch_minutes(last_ts, last_ts_len);
+        int64_t diff = req_mins - last_mins;
+        if (diff < 0) diff = -diff;
+        out[7] = logf(1.0f + (float)diff) / logf(1.0f + MAX_MINUTES);
+        out[8] = clamp01(km_from_current / MAX_KM);
+    } else {
+        out[7] = -1.0f;
+        out[8] = -1.0f;
+    }
+
+    // 9. km_from_home
+    out[9] = clamp01(km_from_home / MAX_KM);
+
+    // 10. tx_count_24h
+    out[10] = clamp01(tx_count_24h / MAX_TX_COUNT);
+
+    // 11. Packed binary: (online + 2*card + 4*unknown) / 7
+    float packed = 0.0f;
+    if (is_online) packed += 1.0f;
+    if (card_present) packed += 2.0f;
+    if (!known_merchant) packed += 4.0f;
+    out[11] = packed / 7.0f;
+
+    // 12. mcc_risk
+    out[12] = (mcc < 65536) ? mcc_risks[mcc] : 0.5f;
+
+    // 13. merchant_avg_amount
+    out[13] = clamp01(merchant_avg_amount / MAX_MERCHANT_AVG);
+
+    // 14, 15. padding / placeholder
+    out[14] = 0.0f;
+    out[15] = 0.0f;
 
     return 1;
 }

@@ -1,4 +1,5 @@
 #include "http_resp.h"
+#include <stdio.h>
 
 const char *score_full[6] = {
     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
@@ -22,3 +23,12 @@ const size_t resp_bad_req_len = 63;
 
 const char *resp_internal_err = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const size_t resp_internal_err_len = 71;
+
+int format_score_response(char *buf, size_t buflen, int approved, float fraud_score) {
+    const char *app = approved ? "true" : "false";
+    char body[64];
+    int body_len = snprintf(body, sizeof(body), "{\"approved\":%s,\"fraud_score\":%.1f}", app, fraud_score);
+    return snprintf(buf, buflen,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+        body_len, body);
+}

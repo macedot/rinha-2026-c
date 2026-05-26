@@ -14,13 +14,10 @@ x-api-common: &api-common
         cpus: "0.45"
         memory: "125M"
   environment: &api-env
-    INDEX_PATH: "/app/resources/index.bin"
+    INDEX_PATH: "/app/data"
     UDS_PATH: "/run/sock/api.sock"
     UDS_MODE: "666"
     UNLINK_UDS: "1"
-    IVF_NPROBE: "5"
-    IVF_FULL_NPROBE: "24"
-    CANDIDATES: "0"
   # No security_opt anywhere
 
 services:
