@@ -1,5 +1,5 @@
 x-api-common: &api-common
-  image: ghcr.io/macedot/rinha-2026-c:latest
+  image: ghcr.io/macedot/rinha-2026-c:v0.3.1
   volumes:
     - rinha-c-sock:/run/sock
   networks:
@@ -21,8 +21,7 @@ x-api-common: &api-common
 
 services:
   lb:
-    image: ghcr.io/macedot/rinha-2026-c:latest
-    entrypoint: ["/app/lb"]
+    image: haproxy:2.9-alpine
     container_name: rinha-c-lb
     restart: always
     depends_on:
@@ -32,20 +31,15 @@ services:
       - "9999:9999"
     volumes:
       - rinha-c-sock:/run/sock
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    command: ["haproxy", "-f", "/usr/local/etc/haproxy/haproxy.cfg", "-V"]
     networks:
       - rinha-c-net
-    environment:
-      - LB_PORT=9999
-      - LB_BACKENDS=/run/sock/api1.sock.ctrl,/run/sock/api2.sock.ctrl
     deploy:
       resources:
         limits:
-          cpus: "0.1"
+          cpus: "0.2"
           memory: "30M"
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
 
   api1:
     <<: *api-common
