@@ -17,6 +17,11 @@
 !src/*.c
 !src/*.h
 
+# Allow indexer
+!indexer/
+!indexer/*.c
+!indexer/Makefile
+
 # Allow tests
 !test/
 !test/*.c

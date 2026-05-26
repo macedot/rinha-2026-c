@@ -1,5 +1,5 @@
 x-api-common: &api-common
-  image: ghcr.io/macedot/rinha-2026-c:v0.3.0
+  build: .
   volumes:
     - rinha-c-sock:/run/sock
   networks:
@@ -21,7 +21,7 @@ x-api-common: &api-common
 
 services:
   lb:
-    image: ghcr.io/macedot/rinha-2026-c:v0.3.0
+    build: .
     entrypoint: ["/app/lb"]
     container_name: rinha-c-lb
     restart: always
