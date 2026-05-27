@@ -21,7 +21,7 @@
 #define N_L1 256
 #define N_L2_PER_L1 256
 #define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
-#define N_ITERATIONS 5  /* temporary low for quick docker/local build during port; will raise + add bbox for final 0/0 */
+#define N_ITERATIONS 20  /* good quality for final; for very fast docker builds use pre-generated part*.bin like ASM repo or lower via edit */
 
 /* ASM reference constants (full 4-partition 2048-cluster + bbox port in progress) */
 #define N_PARTITIONS 4
