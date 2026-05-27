@@ -324,7 +324,7 @@ int main(int argc, char **argv) {
 
         printf("Partition %d: %d records, 2048 clusters written\n", t, pn);
 
-        /* Basic bbox for pruning (float for now; will quantize to i16 like ASM in later step) */
+        /* Compute per-cluster axis-aligned bbox (float for now; ASM uses i16 quantized + SoA pairs) */
         float *bmin = (float *)malloc((size_t)N_CLUSTERS * DIM * sizeof(float));
         float *bmax = (float *)malloc((size_t)N_CLUSTERS * DIM * sizeof(float));
         for (int c = 0; c < N_CLUSTERS; c++) {
@@ -333,11 +333,32 @@ int main(int argc, char **argv) {
                 bmax[c*DIM + d] = -1e30f;
             }
         }
-        for (int i = 0; i < pn; i++) {
-            int c = ass[i];  /* original assignment before sort? Wait, after sort we have psorted, but ass is old. Use the offsets on psorted. */
-            /* Simpler: since we have psorted and poff, scan the sorted records */
+        for (int c = 0; c < N_CLUSTERS; c++) {
+            uint32_t start = poff[c];
+            uint32_t end = poff[c+1];
+            for (uint32_t i = start; i < end; i++) {
+                const float *v = psorted + (size_t)i * OUT_DIM;
+                for (int d = 0; d < DIM; d++) {
+                    if (v[d] < bmin[c*DIM + d]) bmin[c*DIM + d] = v[d];
+                    if (v[d] > bmax[c*DIM + d]) bmax[c*DIM + d] = v[d];
+                }
+            }
         }
-        /* For correctness in this step, skip full bbox computation here (will add proper in next micro-commit). Files written without bbox for now. */
+
+        char bpath[4096];
+        FILE *bfp;
+        snprintf(bpath, sizeof(bpath), "%s/part%d_bbox_min.bin", argv[2], t);
+        bfp = fopen(bpath, "wb");
+        fwrite(bmin, sizeof(float), (size_t)N_CLUSTERS * DIM, bfp);
+        fclose(bfp);
+
+        snprintf(bpath, sizeof(bpath), "%s/part%d_bbox_max.bin", argv[2], t);
+        bfp = fopen(bpath, "wb");
+        fwrite(bmax, sizeof(float), (size_t)N_CLUSTERS * DIM, bfp);
+        fclose(bfp);
+
+        printf("  BBox written for partition %d\n", t);
+
         free(bmin);
         free(bmax);
 
