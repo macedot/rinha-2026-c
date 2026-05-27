@@ -1,0 +1,24 @@
+Fidelity checkpoint: squared-L2 kmeans (80 iters) — 2026-05-27
+
+Previous baseline (Manhattan kmeans + float bbox):
+  ~956 errors (historically 360 FP + 596 FN on the 54,100-case oracle)
+
+This run (squared L2 kmeans + same float bbox path):
+  TP: 23406  TN: 29719  FP: 422  FN: 553  ERR: 0
+  Total errors (FP + FN) = 975
+
+Net: almost flat (975 vs previous ~956 floor). 
+L2 training geometry helped some borderline cases (FN down) 
+but regressed others (FP up slightly). 
+
+Conclusion: metric alignment alone is not sufficient for 0/0.
+Next required fidelity step: int16 quantization of vectors + 
+i16 bbox + matching lower-bound + distance math in the search path
+(to achieve numerical equivalence with ASM's quantized space).
+
+Index generated with:
+  ./indexer/indexer resources/references.json.gz data
+  (corrected l2sq_dist in kmeans_run)
+
+Test command:
+  ./test_knn_accuracy   (built with -O3 -march=haswell -mavx2)
