@@ -18,9 +18,10 @@
 
 #define DIM 14
 #define OUT_DIM 16
-#define N_CLUSTERS 2048
-#define N_PARTITIONS 4
-#define N_ITERATIONS 12  /* quality vs build time: sufficient for 0 FP/FN with tag partition + repair */
+#define N_L1 256
+#define N_L2_PER_L1 256
+#define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
+#define N_ITERATIONS 20
 
 static const float FEATURE_WEIGHTS[OUT_DIM] = {
     1.0038165f, 0.665417f, 0.8668326f, 0.5379362f,
