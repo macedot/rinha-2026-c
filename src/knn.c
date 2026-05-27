@@ -10,23 +10,26 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* ASM port constants (exact from the reference macros.inc) */
 #define DIM 16
-#define K_NEIGHBORS 7
-#define N_L1 256
-#define N_L2_PER_L1 256
-#define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
-#define N_PROBE_L1 32
-#define N_PROBE_L2 512
-#define N_PROBE_L2_EXTENDED 1024   /* higher coverage on the classic 256x256 structure */
-#define APPROVAL_THRESHOLD 0.44f
-#define CONFIDENCE_LOW 0.38f
-#define CONFIDENCE_HIGH 0.50f
-#define EARLY_EXIT_DIST 0.05f
-#define MAX_DIST_TRIGGER 1.5f
+#define K_NEIGHBORS 5
+#define N_PARTITIONS 4
+#define N_CLUSTERS 2048
+#define NPROBE_INITIAL 12
+#define NPROBE_REPAIR_MIN 1
+#define NPROBE_REPAIR_MAX 4
+#define SCALE 10000
+#define IDX_BITS 22
+#define CID_BITS 12
 
+#define APPROVAL_THRESHOLD 0.5f          /* count-based: <=2 frauds in top-5 → approved */
+#define EARLY_EXIT_DIST 0.01f
+#define MAX_DIST_TRIGGER 2.0f
+
+/* All 1.0 — ASM linear normalized space needs no extra weighting */
 static const float FEATURE_WEIGHTS[DIM] = {
-    1.0038165f, 0.665417f, 0.8668326f, 0.5379362f, 0.5f, 0.3f, 0.3701757f,
-    1.0f, 1.2f, 1.2648705f, 0.81239825f, 1.051987f, 0.8247206f, 2.0315619f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
     0.0f, 0.0f
 };
 
