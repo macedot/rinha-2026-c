@@ -15,9 +15,9 @@
 #define N_L1 256
 #define N_L2_PER_L1 256
 #define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
-#define N_PROBE_L1 16
-#define N_PROBE_L2 256
-#define N_PROBE_L2_EXTENDED 512
+#define N_PROBE_L1 32
+#define N_PROBE_L2 512
+#define N_PROBE_L2_EXTENDED 1024   /* higher coverage on the classic 256x256 structure */
 #define APPROVAL_THRESHOLD 0.44f
 #define CONFIDENCE_LOW 0.38f
 #define CONFIDENCE_HIGH 0.50f
