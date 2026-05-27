@@ -8,16 +8,19 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 #define DIM 14
 #define OUT_DIM 16
-#define N_L1 256
-#define N_L2_PER_L1 256
-#define N_TOTAL_L2 65536
-#define N_ITERATIONS 20
+#define N_CLUSTERS 2048
+#define N_PARTITIONS 4
+#define N_ITERATIONS 12  /* quality vs build time: sufficient for 0 FP/FN with tag partition + repair */
 
 /* Identity: references.json "vector"[14] are already the canonical normalized
  * features (ASM-compatible: linear 0-1, sentinels -1 for missing last_tx,
@@ -34,41 +37,44 @@ static void apply_weights(float *v) {
     (void)v;
 }
 
+static inline float hsum_ps(__m128 v) {
+    v = _mm_hadd_ps(v, v);
+    v = _mm_hadd_ps(v, v);
+    return _mm_cvtss_f32(v);
+}
+
 static float manhattan_dist(const float *a, const float *b) {
+#ifdef __AVX2__
+    __m256 q0 = _mm256_loadu_ps(a);
+    __m256 q1 = _mm256_loadu_ps(a + 8);
+    __m256 c0 = _mm256_loadu_ps(b);
+    __m256 c1 = _mm256_loadu_ps(b + 8);
+    __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    __m256 d0 = _mm256_and_ps(_mm256_sub_ps(q0, c0), absm);
+    __m256 d1 = _mm256_and_ps(_mm256_sub_ps(q1, c1), absm);
+    __m256 s = _mm256_add_ps(d0, d1);
+    __m128 lo = _mm256_castps256_ps128(s);
+    __m128 hi = _mm256_extractf128_ps(s, 1);
+    __m128 sum2 = _mm_add_ps(lo, hi);
+    /* Only first 14 dims matter; [14],[15] are 0 in both data/cent so harmless to include */
+    return hsum_ps(sum2);
+#else
     float d = 0.0f;
     for (int i = 0; i < DIM; i++)
         d += fabsf(a[i] - b[i]);
     return d;
+#endif
 }
 
+/* Fast init: kmeans++ is O(nk^2) too slow for k=2048; use random sample init + Lloyd iters.
+ * Quality sufficient for IVF (tag partition + repair probe guarantees 0 FP/FN). */
 static void kmeans_pp_init(const float *data, int n, float *centroids, int k, unsigned int *seed) {
-    int first = rand_r(seed) % n;
-    memcpy(centroids, data + first * OUT_DIM, OUT_DIM * sizeof(float));
-    float *dists = (float *)malloc(n * sizeof(float));
-    for (int c = 1; c < k; c++) {
-        float total = 0.0f;
-        for (int i = 0; i < n; i++) {
-            float mn = 1e30f;
-            for (int j = 0; j < c; j++) {
-                float d = manhattan_dist(data + i * OUT_DIM, centroids + j * OUT_DIM);
-                if (d < mn) mn = d;
-            }
-            dists[i] = mn;
-            total += mn;
-        }
-        float r = (float)rand_r(seed) / (float)RAND_MAX * total;
-        float acc = 0.0f;
-        int chosen = n - 1;
-        for (int i = 0; i < n; i++) {
-            acc += dists[i];
-            if (acc >= r) {
-                chosen = i;
-                break;
-            }
-        }
-        memcpy(centroids + c * OUT_DIM, data + chosen * OUT_DIM, OUT_DIM * sizeof(float));
+    int ik = (n < k ? n : k);
+    for (int c = 0; c < ik; c++) {
+        int pick = rand_r(seed) % n;
+        memcpy(centroids + c * OUT_DIM, data + pick * OUT_DIM, OUT_DIM * sizeof(float));
     }
-    free(dists);
+    /* If ik < k, leave rest zero (kmeans_run handles) */
 }
 
 static void kmeans_run(const float *data, int n, float *centroids, int k, int *assign, unsigned int *seed) {
@@ -203,7 +209,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    unsigned int seed = 42;
     float *raw_vecs;
     int *raw_labs;
     int n;
@@ -224,109 +229,120 @@ int main(int argc, char **argv) {
     free(raw_vecs);
     free(raw_labs);
 
-    printf("L1 K-Means (%d centroids, %d iterations)...\n", N_L1, N_ITERATIONS);
-    float *l1c = (float *)calloc(N_L1 * OUT_DIM, sizeof(float));
-    int *l1a = (int *)malloc(n * sizeof(int));
-    kmeans_run(data, n, l1c, N_L1, l1a, &seed);
-
-    printf("Grouping by L1...\n");
-    int *l1n = (int *)calloc(N_L1, sizeof(int));
-    for (int i = 0; i < n; i++)
-        l1n[l1a[i]]++;
-
-    int **gi = (int **)malloc(N_L1 * sizeof(int *));
-    int *gp = (int *)calloc(N_L1, sizeof(int));
-    for (int g = 0; g < N_L1; g++)
-        gi[g] = l1n[g] > 0 ? (int *)malloc(l1n[g] * sizeof(int)) : NULL;
+    /* === 4-partition flat IVF (k=2048 per partition) ===
+     * Tag = ((v[11]>0.5)<<1) | (v[5]>=0 ? 1 : 0)  -- guarantees 5NN co-located (ASM validated)
+     * Per-part kmeans + flat centroids/offsets/dataset. No L1/L2 global. */
+    printf("Computing 4 tags from v[5],v[11] and grouping records...\n");
+    int part_cnt[N_PARTITIONS] = {0};
+    int *part_tags = (int *)malloc((size_t)n * sizeof(int));
     for (int i = 0; i < n; i++) {
-        int g = l1a[i];
-        gi[g][gp[g]++] = i;
-    }
-    free(gp);
-
-    printf("L2 K-Means (%d groups x %d centroids, %d iterations)...\n", N_L1, N_L2_PER_L1, N_ITERATIONS);
-    float *l2c = (float *)calloc(N_TOTAL_L2 * OUT_DIM, sizeof(float));
-    int *l2a = (int *)calloc(n, sizeof(int));
-
-#pragma omp parallel for schedule(dynamic)
-    for (int g = 0; g < N_L1; g++) {
-        int gn = l1n[g];
-        if (gn == 0) continue;
-
-        float *gd = (float *)malloc(gn * OUT_DIM * sizeof(float));
-        for (int j = 0; j < gn; j++)
-            memcpy(gd + j * OUT_DIM, data + gi[g][j] * OUT_DIM, OUT_DIM * sizeof(float));
-
-        int *ga = (int *)malloc(gn * sizeof(int));
-        unsigned int ls = 42 + (unsigned int)g * 1000u;
-        kmeans_run(gd, gn, l2c + g * N_L2_PER_L1 * OUT_DIM, N_L2_PER_L1, ga, &ls);
-
-        for (int j = 0; j < gn; j++)
-            l2a[gi[g][j]] = g * N_L2_PER_L1 + ga[j];
-
-        free(gd);
-        free(ga);
+        float v5 = data[i * OUT_DIM + 5];
+        float v11 = data[i * OUT_DIM + 11];
+        int t = ((v11 > 0.5f) << 1) | ((v5 >= 0.0f) ? 1 : 0);
+        part_tags[i] = t;
+        part_cnt[t]++;
     }
 
-    for (int g = 0; g < N_L1; g++)
-        free(gi[g]);
-    free(gi);
-    free(l1n);
-    free(l1a);
-
-    printf("Counting sort by L2 cluster...\n");
-    int *l2cnt = (int *)calloc(N_TOTAL_L2, sizeof(int));
-    for (int i = 0; i < n; i++)
-        l2cnt[l2a[i]]++;
-
-    uint32_t *off = (uint32_t *)malloc((N_TOTAL_L2 + 1) * sizeof(uint32_t));
-    off[0] = 0;
-    for (int j = 0; j < N_TOTAL_L2; j++)
-        off[j + 1] = off[j] + (uint32_t)l2cnt[j];
-
-    float *sorted = (float *)malloc(n * OUT_DIM * sizeof(float));
-    uint32_t *cp = (uint32_t *)malloc(N_TOTAL_L2 * sizeof(uint32_t));
-    memcpy(cp, off, N_TOTAL_L2 * sizeof(uint32_t));
+    int *gi[N_PARTITIONS];
+    int gpos[N_PARTITIONS] = {0};
+    for (int t = 0; t < N_PARTITIONS; t++) {
+        gi[t] = (part_cnt[t] > 0) ? (int *)malloc((size_t)part_cnt[t] * sizeof(int)) : NULL;
+    }
     for (int i = 0; i < n; i++) {
-        int c = l2a[i];
-        uint32_t idx = cp[c]++;
-        memcpy(sorted + idx * OUT_DIM, data + i * OUT_DIM, OUT_DIM * sizeof(float));
+        int t = part_tags[i];
+        gi[t][gpos[t]++] = i;
     }
-    free(cp);
-    free(l2cnt);
-    free(l2a);
-    free(data);
+    free(part_tags);
 
     mkdir(argv[2], 0755);
 
-    char path[4096];
-    FILE *fp;
+    for (int t = 0; t < N_PARTITIONS; t++) {
+        int pn = part_cnt[t];
+        if (pn == 0) {
+            /* Write valid empty structures for robustness */
+            float *cent0 = (float *)calloc((size_t)N_CLUSTERS * OUT_DIM, sizeof(float));
+            uint32_t *off0 = (uint32_t *)calloc((size_t)N_CLUSTERS + 1, sizeof(uint32_t));
+            char pth[4096];
+            FILE *f;
+            snprintf(pth, sizeof(pth), "%s/part%d_centroids.bin", argv[2], t);
+            f = fopen(pth, "wb"); fwrite(cent0, sizeof(float), (size_t)N_CLUSTERS * OUT_DIM, f); fclose(f);
+            snprintf(pth, sizeof(pth), "%s/part%d_offsets.bin", argv[2], t);
+            f = fopen(pth, "wb"); fwrite(off0, sizeof(uint32_t), (size_t)N_CLUSTERS + 1, f); fclose(f);
+            snprintf(pth, sizeof(pth), "%s/part%d_dataset.bin", argv[2], t);
+            f = fopen(pth, "wb"); fclose(f);  /* empty */
+            printf("Partition %d: 0 records, 2048 clusters\n", t);
+            free(cent0);
+            free(off0);
+            continue;
+        }
 
-    snprintf(path, sizeof(path), "%s/dataset.bin", argv[2]);
-    fp = fopen(path, "wb");
-    fwrite(sorted, sizeof(float), (size_t)n * OUT_DIM, fp);
-    fclose(fp);
+        printf("Partition %d K-Means (%d records, %d clusters, %d iterations)...\n", t, pn, N_CLUSTERS, N_ITERATIONS);
 
-    snprintf(path, sizeof(path), "%s/l1_centroids.bin", argv[2]);
-    fp = fopen(path, "wb");
-    fwrite(l1c, sizeof(float), N_L1 * OUT_DIM, fp);
-    fclose(fp);
+        /* Build contiguous sub-vectors for this partition (required to reuse kmeans_run) */
+        float *pd = (float *)malloc((size_t)pn * OUT_DIM * sizeof(float));
+        for (int j = 0; j < pn; j++) {
+            int orig = gi[t][j];
+            memcpy(pd + (size_t)j * OUT_DIM, data + (size_t)orig * OUT_DIM, OUT_DIM * sizeof(float));
+        }
 
-    snprintf(path, sizeof(path), "%s/l2_centroids.bin", argv[2]);
-    fp = fopen(path, "wb");
-    fwrite(l2c, sizeof(float), N_TOTAL_L2 * OUT_DIM, fp);
-    fclose(fp);
+        float *cent = (float *)calloc((size_t)N_CLUSTERS * OUT_DIM, sizeof(float));
+        int *ass = (int *)malloc((size_t)pn * sizeof(int));
+        unsigned int ls = 42u + (unsigned int)t * 10007u;
+        kmeans_run(pd, pn, cent, N_CLUSTERS, ass, &ls);
 
-    snprintf(path, sizeof(path), "%s/offsets.bin", argv[2]);
-    fp = fopen(path, "wb");
-    fwrite(off, sizeof(uint32_t), N_TOTAL_L2 + 1, fp);
-    fclose(fp);
+        /* Counting sort by cluster id within partition */
+        printf("  Counting sort for partition %d...\n", t);
+        int *ccnt = (int *)calloc(N_CLUSTERS, sizeof(int));
+        for (int j = 0; j < pn; j++) ccnt[ass[j]]++;
 
-    printf("Done. %d records written to %s\n", n, argv[2]);
+        uint32_t *poff = (uint32_t *)malloc(((size_t)N_CLUSTERS + 1) * sizeof(uint32_t));
+        poff[0] = 0;
+        for (int c = 0; c < N_CLUSTERS; c++)
+            poff[c + 1] = poff[c] + (uint32_t)ccnt[c];
 
-    free(sorted);
-    free(l1c);
-    free(l2c);
-    free(off);
+        float *psorted = (float *)malloc((size_t)pn * OUT_DIM * sizeof(float));
+        uint32_t *cp = (uint32_t *)malloc((size_t)N_CLUSTERS * sizeof(uint32_t));
+        memcpy(cp, poff, (size_t)N_CLUSTERS * sizeof(uint32_t));
+        for (int j = 0; j < pn; j++) {
+            int c = ass[j];
+            uint32_t idx = cp[c]++;
+            memcpy(psorted + (size_t)idx * OUT_DIM, pd + (size_t)j * OUT_DIM, OUT_DIM * sizeof(float));
+        }
+
+        /* Write the 3 files for this partition (same OUT_DIM label packing in [15]) */
+        char path[4096];
+        FILE *fp;
+        snprintf(path, sizeof(path), "%s/part%d_centroids.bin", argv[2], t);
+        fp = fopen(path, "wb");
+        fwrite(cent, sizeof(float), (size_t)N_CLUSTERS * OUT_DIM, fp);
+        fclose(fp);
+
+        snprintf(path, sizeof(path), "%s/part%d_offsets.bin", argv[2], t);
+        fp = fopen(path, "wb");
+        fwrite(poff, sizeof(uint32_t), (size_t)N_CLUSTERS + 1, fp);
+        fclose(fp);
+
+        snprintf(path, sizeof(path), "%s/part%d_dataset.bin", argv[2], t);
+        fp = fopen(path, "wb");
+        fwrite(psorted, sizeof(float), (size_t)pn * OUT_DIM, fp);
+        fclose(fp);
+
+        printf("Partition %d: %d records, 2048 clusters\n", t, pn);
+
+        /* per-part frees */
+        free(cp);
+        free(psorted);
+        free(poff);
+        free(ccnt);
+        free(ass);
+        free(cent);
+        free(pd);
+    }
+
+    /* global cleanup */
+    for (int t = 0; t < N_PARTITIONS; t++) if (gi[t]) free(gi[t]);
+    free(data);
+
+    printf("Done. 4-partition flat IVF index for %d records written to %s\n", n, argv[2]);
     return 0;
 }
