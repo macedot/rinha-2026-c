@@ -11,14 +11,15 @@
 #include <unistd.h>
 
 #define DIM 16
-#define K_NEIGHBORS 5
+#define K_NEIGHBORS 7
 #define N_PARTITIONS 4
 #define N_CLUSTERS 2048
-#define N_PROBE 32             /* initial; always +256 medium for coverage */
-#define N_PROBE_REPAIR_EXTRA 2048 /* full on truly ambiguous after medium */
-#define APPROVAL_THRESHOLD 0.5f
-#define EARLY_EXIT_DIST 0.01f  /* very close NN -> early exact decision */
-#define MAX_DIST_TRIGGER 2.0f
+#define N_PROBE 32
+#define APPROVAL_THRESHOLD 0.44f
+#define CONFIDENCE_LOW 0.38f
+#define CONFIDENCE_HIGH 0.50f
+#define EARLY_EXIT_DIST 0.05f
+#define MAX_DIST_TRIGGER 1.5f
 
 /* All 1.0: canonical normalized features need no extra per-dim weighting (ASM-style) */
 static const float FEATURE_WEIGHTS[DIM] = {
@@ -248,10 +249,15 @@ static inline int calculate_score(topk_t *topk, float *score_out) {
         return topk[0].label == 0;
     }
 
-    int f = fraud_count_in_topk(topk);
-    int valid = 0;
-    for (int i = 0; i < K_NEIGHBORS; i++) if (topk[i].dist < 1e20f) valid++;
-    float score = (valid > 0) ? (float)f / (float)K_NEIGHBORS : 0.0f;
+    float fraud_weight = 0.0f;
+    float total_weight = 0.0f;
+    for (int i = 0; i < K_NEIGHBORS; i++) {
+        if (topk[i].dist >= 1e20f) continue;
+        float w = expf(-topk[i].dist * 0.5f);
+        total_weight += w;
+        fraud_weight += w * topk[i].label;
+    }
+    float score = (total_weight > 0.0f) ? (fraud_weight / total_weight) : 0.0f;
     *score_out = score;
     return score < APPROVAL_THRESHOLD;
 }
@@ -305,27 +311,12 @@ int rinha_search(const float q_in[DIM], float *fraud_score_out) {
 
     float score;
     int approved = calculate_score(topk, &score);
-    int fcnt = fraud_count_in_topk(topk);
 
-    /* 4. Medium extension (always): +256 clusters for high 5NN recall on hard cases.
-     * Then full repair only on still-ambiguous (1-4). Tag partition + this guarantees 0 FP/FN. */
-    int medium = 256;
-    int maxp = N_PROBE + medium;
-    if (maxp > N_CLUSTERS) maxp = N_CLUSTERS;
-    for (int pi = N_PROBE; pi < maxp; pi++) {
-        max_dist = scan_cluster_in_part(part, c_dists[pi].idx, q, topk, max_dist);
-        if (topk[0].dist < EARLY_EXIT_DIST) {
-            approved = calculate_score(topk, &score);
-            break;
-        }
-    }
-    approved = calculate_score(topk, &score);
-    fcnt = fraud_count_in_topk(topk);
-
-    if (fcnt >= 1 && fcnt <= (K_NEIGHBORS - 1)) {
-        /* full probe on borderline */
-        maxp = N_CLUSTERS;
-        for (int pi = N_PROBE + medium; pi < maxp; pi++) {
+    /* 4. Original adaptive extended probing (confidence zone or poor NN match).
+     * Combined with 4-partition index + Rust features for best chance at 0/0. */
+    if ((score > CONFIDENCE_LOW && score < CONFIDENCE_HIGH) || topk[0].dist > MAX_DIST_TRIGGER) {
+        int maxp = N_CLUSTERS;
+        for (int pi = N_PROBE; pi < maxp; pi++) {
             max_dist = scan_cluster_in_part(part, c_dists[pi].idx, q, topk, max_dist);
             if (topk[0].dist < EARLY_EXIT_DIST) {
                 approved = calculate_score(topk, &score);
@@ -333,10 +324,7 @@ int rinha_search(const float q_in[DIM], float *fraud_score_out) {
             }
         }
         approved = calculate_score(topk, &score);
-    } else if (topk[0].dist > MAX_DIST_TRIGGER) {
-        /* poor match modest extra */
-        maxp = N_PROBE + medium + 128;
-        if (maxp > N_CLUSTERS) maxp = N_CLUSTERS;
+    }
         for (int pi = N_PROBE + medium; pi < maxp; pi++) {
             max_dist = scan_cluster_in_part(part, c_dists[pi].idx, q, topk, max_dist);
         }
