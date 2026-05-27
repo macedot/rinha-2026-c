@@ -235,11 +235,31 @@ int main(int argc, char **argv) {
     free(raw_vecs);
     free(raw_labs);
 
-    /* ASM-style 4 partitions by tag (unknown_merchant, has_last_tx) */
-    printf("Computing ASM tags and grouping into 4 partitions...\n");
-    int part_cnt[N_PARTITIONS] = {0};  /* will define N_PARTITIONS below if needed */
-    /* For now we keep the classic 2-level path while we port the rest of the
-     * ASM index (bbox, partitions, K=5 repair). Full port continues in next steps. */
+    /* === ASM 4-partition flat IVF (2048 clusters per partition) ===
+     * Tag = ((v[11]>0.5)<<1) | (v[5]>=0 ? 1 : 0)
+     * Each partition gets its own 2048-cluster kmeans + bbox data (later).
+     */
+    printf("Computing ASM tags and grouping records into 4 partitions...\n");
+    int part_cnt[N_PARTITIONS] = {0};
+    int *part_tags = (int *)malloc((size_t)n * sizeof(int));
+    for (int i = 0; i < n; i++) {
+        float v5 = data[i * OUT_DIM + 5];
+        float v11 = data[i * OUT_DIM + 11];
+        int t = ((v11 > 0.5f) << 1) | ((v5 >= 0.0f) ? 1 : 0);
+        part_tags[i] = t;
+        part_cnt[t]++;
+    }
+
+    int *gi[N_PARTITIONS];
+    int gpos[N_PARTITIONS] = {0};
+    for (int t = 0; t < N_PARTITIONS; t++) {
+        gi[t] = (part_cnt[t] > 0) ? (int *)malloc((size_t)part_cnt[t] * sizeof(int)) : NULL;
+    }
+    for (int i = 0; i < n; i++) {
+        int t = part_tags[i];
+        gi[t][gpos[t]++] = i;
+    }
+    free(part_tags);
 
     /* === Classic 2-level HIVF (256 L1 × 256 L2) - the structure that previously
      * achieved 0 FP/FN when paired with Rust features + weighted K=7 scoring. */
