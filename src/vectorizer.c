@@ -248,66 +248,70 @@ int vectorizer_build(const char *body, size_t body_len, float out[VEC_DIM]) {
             mcc = mcc * 10 + (unsigned)(mcc_str[i] - '0');
     }
 
-    /* --- Compute new 16-dim feature vector (original Rust-style that generated the test expectations) --- */
+    /* --- Compute 14-dim ASM-linear features (exact match to ASM vectorize.asm) ---
+     * This is the canonical space used by the ASM reference for both indexing
+     * and queries. References.json "vector" values are already in this space.
+     */
+    int64_t req_epoch = parse_iso8601(req_ts, req_ts_len);
+    int64_t last_epoch = has_last_tx ? parse_iso8601(last_ts, last_ts_len) : 0;
 
-    // 0. ln(1 + amount) / ln(1 + max_amount)
-    out[0] = logf(1.0f + amount) / logf(1.0f + MAX_AMOUNT);
+    /* hour [0..23], dow [0..6] computed exactly as in ASM (from epoch seconds) */
+    int64_t days = req_epoch / 86400;
+    int dow = (int)((days + 3) % 7 + 7) % 7;
+    int hour = (int)((req_epoch / 3600) % 24 + 24) % 24;
 
-    // 1. installments / max_installments
+    // 0. amount / 10000 (linear)
+    out[0] = clamp01(amount / MAX_AMOUNT);
+
+    // 1. installments / 12
     out[1] = clamp01(installments / MAX_INSTALLMENTS);
 
-    // 2. amount_vs_avg_ratio
+    // 2. (amount / cust_avg / 10) or 0 (ASM default)
     float ratio = (customer_avg_amount > 0.0f)
         ? (amount / customer_avg_amount) / MAX_AVG_RATIO
-        : 1.0f;
+        : 0.0f;
     out[2] = clamp01(ratio);
 
-    // 3. hour_sin, 4. hour_cos
-    int hour = parse_iso_hour(req_ts, req_ts_len);
-    int dow = parse_iso_dow(req_ts, req_ts_len);
-    float hour_rad = hour * 2.0f * (float)M_PI / 24.0f;
-    float day_rad = dow * 2.0f * (float)M_PI / 7.0f;
-    out[3] = sinf(hour_rad);
-    out[4] = cosf(hour_rad);
+    // 3. hour / 23 (linear, not sin/cos)
+    out[3] = clamp01((float)hour / 23.0f);
 
-    // 5. day_sin, 6. day_cos
-    out[5] = sinf(day_rad);
-    out[6] = cosf(day_rad);
+    // 4. dow / 6 (linear)
+    out[4] = clamp01((float)dow / 6.0f);
 
-    // 7. ln(1 + minutes) / ln(1 + max_minutes)
-    // 8. km_from_last_tx
+    // 5. diff_minutes / 1440 or -1 ; 6. km_last / 1000 or -1
     if (has_last_tx) {
-        int64_t req_mins = iso_to_epoch_minutes(req_ts, req_ts_len);
-        int64_t last_mins = iso_to_epoch_minutes(last_ts, last_ts_len);
-        int64_t diff = req_mins - last_mins;
-        if (diff < 0) diff = -diff;
-        out[7] = logf(1.0f + (float)diff) / logf(1.0f + MAX_MINUTES);
-        out[8] = clamp01(km_from_current / MAX_KM);
+        double diff_sec = (double)(req_epoch - last_epoch);
+        if (diff_sec < 0) diff_sec = -diff_sec;
+        float min_norm = (float)(diff_sec / 60.0 / 1440.0);
+        out[5] = clamp01(min_norm);
+        out[6] = clamp01(km_from_current / MAX_KM);
     } else {
-        out[7] = -1.0f;
-        out[8] = -1.0f;
+        out[5] = -1.0f;
+        out[6] = -1.0f;
     }
 
-    // 9. km_from_home
-    out[9] = clamp01(km_from_home / MAX_KM);
+    // 7. km_from_home / 1000
+    out[7] = clamp01(km_from_home / MAX_KM);
 
-    // 10. tx_count_24h
-    out[10] = clamp01(tx_count_24h / MAX_TX_COUNT);
+    // 8. tx_count_24h / 20
+    out[8] = clamp01(tx_count_24h / MAX_TX_COUNT);
 
-    // 11. Packed binary: (online + 2*card + 4*unknown) / 7
-    float packed = 0.0f;
-    if (is_online) packed += 1.0f;
-    if (card_present) packed += 2.0f;
-    if (!known_merchant) packed += 4.0f;
-    out[11] = packed / 7.0f;
+    // 9. is_online ? 1 : 0
+    out[9] = is_online ? 1.0f : 0.0f;
+
+    // 10. card_present ? 1 : 0
+    out[10] = card_present ? 1.0f : 0.0f;
+
+    // 11. unknown_merchant ? 1 : 0
+    out[11] = known_merchant ? 0.0f : 1.0f;
 
     // 12. mcc_risk
     out[12] = (mcc < 65536) ? mcc_risks[mcc] : 0.5f;
 
-    // 13. merchant_avg_amount
+    // 13. merchant_avg / 10000
     out[13] = clamp01(merchant_avg_amount / MAX_MERCHANT_AVG);
 
-    // 14, 15. padding / placeholder
+    // 14,15 padding
     out[14] = 0.0f;
     out[15] = 0.0f;
 
