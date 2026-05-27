@@ -185,15 +185,24 @@ static int cmp_dist_asc(const void *a, const void *b) {
     return (da < db) ? -1 : (da > db) ? 1 : 0;
 }
 
-/* --- Scan cluster records --- */
+/* Old 2-level scan_cluster removed during ASM partition port (replaced by scan_cluster_in_part for part_t). */
 
-static inline float scan_cluster(int l2_idx, const float q[DIM],
-                                  topk_t *topk, float max_dist) {
-    uint32_t start = g_index.offsets[l2_idx];
-    uint32_t end = g_index.offsets[l2_idx + 1];
+static inline int fraud_count_in_topk(const topk_t *topk) {
+    int cnt = 0;
+    for (int i = 0; i < K_NEIGHBORS; i++) {
+        if (topk[i].dist < 1e20f && topk[i].label) cnt++;
+    }
+    return cnt;
+}
+
+static inline float scan_cluster_in_part(const part_t *part, int cluster_id,
+                                         const float q[DIM], topk_t *topk, float max_dist) {
+    if (cluster_id < 0 || cluster_id >= N_CLUSTERS) return max_dist;
+    uint32_t start = part->offsets[cluster_id];
+    uint32_t end = part->offsets[cluster_id + 1];
     if (end <= start) return max_dist;
 
-    const float *records = g_index.dataset + (size_t)start * DIM;
+    const float *records = part->dataset + (size_t)start * DIM;
     int n = (int)(end - start);
 
 #ifdef __AVX2__
