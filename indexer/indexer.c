@@ -21,7 +21,7 @@
 #define N_L1 256
 #define N_L2_PER_L1 256
 #define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
-#define N_ITERATIONS 20
+#define N_ITERATIONS 40  /* higher quality centroids for better recall on hard test cases */
 
 static unsigned int global_seed = 42;
 
