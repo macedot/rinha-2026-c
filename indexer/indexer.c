@@ -18,16 +18,11 @@
 
 #define DIM 14
 #define OUT_DIM 16
-#define N_L1 256
-#define N_L2_PER_L1 256
-#define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
-#define N_ITERATIONS 80  /* very high quality clusters — final push for 0/0 on remaining hard cases */
+#define N_ITERATIONS 80  /* high quality for fidelity with ASM (squared L2 kmeans + bbox) */
 
-/* ASM reference constants (full 4-partition 2048-cluster + bbox port in progress) */
+/* ASM 4-partition flat IVF constants */
 #define N_PARTITIONS 4
 #define N_CLUSTERS 2048
-
-static unsigned int global_seed = 42;
 
 /* ASM canonical space: references.json "vector"[] are already the final normalized
  * linear features. Extract is now identity (no transforms). */
@@ -49,44 +44,49 @@ static inline float hsum_ps(__m128 v) {
     return _mm_cvtss_f32(v);
 }
 
-static float manhattan_dist(const float *a, const float *b) {
+/* Squared L2 distance — must match the distance used at search time in knn.c
+ * (and the ASM reference). Using Manhattan during kmeans produced clusters
+ * whose geometry did not match query-time ranking → persistent FP/FN.
+ */
+static float l2sq_dist(const float *a, const float *b) {
 #ifdef __AVX2__
     __m256 q0 = _mm256_loadu_ps(a);
     __m256 q1 = _mm256_loadu_ps(a + 8);
     __m256 c0 = _mm256_loadu_ps(b);
     __m256 c1 = _mm256_loadu_ps(b + 8);
-    __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
-    __m256 d0 = _mm256_and_ps(_mm256_sub_ps(q0, c0), absm);
-    __m256 d1 = _mm256_and_ps(_mm256_sub_ps(q1, c1), absm);
-    __m256 s = _mm256_add_ps(d0, d1);
+    __m256 d0 = _mm256_sub_ps(q0, c0);
+    __m256 d1 = _mm256_sub_ps(q1, c1);
+    __m256 s0 = _mm256_mul_ps(d0, d0);
+    __m256 s1 = _mm256_mul_ps(d1, d1);
+    __m256 s = _mm256_add_ps(s0, s1);
     __m128 lo = _mm256_castps256_ps128(s);
     __m128 hi = _mm256_extractf128_ps(s, 1);
-    __m128 sum2 = _mm_add_ps(lo, hi);
-    /* Only first 14 dims matter; [14],[15] are 0 in both data/cent so harmless to include */
-    return hsum_ps(sum2);
+    /* Only first 14 dims matter; [14],[15] are 0 in both data/cent */
+    return hsum_ps(_mm_add_ps(lo, hi));
 #else
-    float d = 0.0f;
-    for (int i = 0; i < DIM; i++)
-        d += fabsf(a[i] - b[i]);
-    return d;
+    float sum = 0.0f;
+    for (int i = 0; i < DIM; i++) {
+        float d = a[i] - b[i];
+        sum += d * d;
+    }
+    return sum;
 #endif
 }
 
-/* Fast init: kmeans++ is O(nk^2) too slow for k=2048; use random sample init + Lloyd iters.
- * Quality sufficient for IVF (tag partition + repair probe guarantees 0 FP/FN). */
-static void kmeans_pp_init(const float *data, int n, float *centroids, int k, unsigned int *seed) {
+/* Random sample init (kmeans++ is too slow for k=2048 on 3M points).
+ * Lloyd iterations with squared L2 assignment for fidelity with ASM search. */
+static void random_init(const float *data, int n, float *centroids, int k, unsigned int *seed) {
     int ik = (n < k ? n : k);
     for (int c = 0; c < ik; c++) {
         int pick = rand_r(seed) % n;
         memcpy(centroids + c * OUT_DIM, data + pick * OUT_DIM, OUT_DIM * sizeof(float));
     }
-    /* If ik < k, leave rest zero (kmeans_run handles) */
 }
 
 static void kmeans_run(const float *data, int n, float *centroids, int k, int *assign, unsigned int *seed) {
     int ik = n < k ? n : k;
     if (ik <= 0) return;
-    kmeans_pp_init(data, n, centroids, ik, seed);
+    random_init(data, n, centroids, ik, seed);
     float *old_c = (float *)malloc(k * OUT_DIM * sizeof(float));
     int *counts = (int *)malloc(k * sizeof(int));
     for (int iter = 0; iter < N_ITERATIONS; iter++) {
@@ -94,7 +94,7 @@ static void kmeans_run(const float *data, int n, float *centroids, int k, int *a
             float mn = 1e30f;
             int best = 0;
             for (int j = 0; j < k; j++) {
-                float d = manhattan_dist(data + i * OUT_DIM, centroids + j * OUT_DIM);
+                float d = l2sq_dist(data + i * OUT_DIM, centroids + j * OUT_DIM);
                 if (d < mn) {
                     mn = d;
                     best = j;
@@ -237,7 +237,7 @@ int main(int argc, char **argv) {
 
     /* === ASM 4-partition flat IVF (2048 clusters per partition) ===
      * Tag = ((v[11]>0.5)<<1) | (v[5]>=0 ? 1 : 0)
-     * Each partition gets its own 2048-cluster kmeans + bbox data (later).
+     * Squared-L2 kmeans (fidelity with search/ASM) + per-cluster float bbox for now.
      */
     printf("Computing ASM tags and grouping records into 4 partitions...\n");
     int part_cnt[N_PARTITIONS] = {0};
@@ -324,7 +324,7 @@ int main(int argc, char **argv) {
 
         printf("Partition %d: %d records, 2048 clusters written\n", t, pn);
 
-        /* Compute per-cluster axis-aligned bbox (float for now; ASM uses i16 quantized + SoA pairs) */
+        /* Compute per-cluster axis-aligned bbox (float for now; next fidelity step will move to i16) */
         float *bmin = (float *)malloc((size_t)N_CLUSTERS * DIM * sizeof(float));
         float *bmax = (float *)malloc((size_t)N_CLUSTERS * DIM * sizeof(float));
         for (int c = 0; c < N_CLUSTERS; c++) {
