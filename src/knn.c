@@ -336,7 +336,7 @@ int rinha_search(const float q_in[DIM], float *fraud_score_out) {
      * After initial probes, if top-K is not unanimous (not 0 or 5 frauds),
      * force a very large additional probe budget. */
     if (fcnt > 0 && fcnt < K_NEIGHBORS) {
-        int target = 768;  /* large but not always full */
+        int target = 1536;  /* very large fraction on any uncertainty — final push for 0/0 */
         for (int pi = nprobe; pi < target && pi < N_CLUSTERS; pi++) {
             int c = lb_dists[pi].idx;
             if (lb_dists[pi].dist >= max_dist) break;
