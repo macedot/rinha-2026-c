@@ -10,9 +10,9 @@ COPY indexer/ indexer/
 COPY resources/ resources/
 
 ARG INPUT_FILE=resources/references.json.gz
-# For fast docker compose builds during development, pre-generate the 4 part*.bin
-# files locally (make -C indexer && indexer/indexer resources/references.json.gz data)
-# and they will be in the build context. The indexer run below is kept so "main builds it".
+# Fast path for docker compose: pre-generate part*.bin locally once and they are picked up.
+# The RUN below still executes (so main "builds it"), but you can lower iters for CI speed
+# by editing N_ITERATIONS temporarily or using a build arg in future.
 RUN make indexer/indexer && \
     indexer/indexer $INPUT_FILE data && \
     make
