@@ -19,42 +19,19 @@
 #define N_TOTAL_L2 65536
 #define N_ITERATIONS 20
 
-static const float FEATURE_WEIGHTS[OUT_DIM] = {
-    1.0038165f, 0.665417f, 0.8668326f, 0.5379362f,
-    0.5f, 0.3f, 0.3701757f, 1.0f,
-    1.2f, 1.2648705f, 0.81239825f, 1.051987f,
-    0.8247206f, 2.0315619f, 0.0f, 0.0f
-};
-
+/* Identity: references.json "vector"[14] are already the canonical normalized
+ * features (ASM-compatible: linear 0-1, sentinels -1 for missing last_tx,
+ * separate binary flags, no sin/cos or extra logs). Copy as-is. */
 static void extract_features(const float *src, int id, int fraud, float *dst) {
-    dst[0] = logf(1.0f + src[0] * 10000.0f) / logf(1.0f + 10000.0f);
-    dst[1] = src[1];
-    dst[2] = src[2];
-    float hour = src[3] * 23.0f;
-    dst[3] = sinf(hour * 2.0f * (float)M_PI / 24.0f);
-    dst[4] = cosf(hour * 2.0f * (float)M_PI / 24.0f);
-    float dow = src[4] * 6.0f;
-    dst[5] = sinf(dow * 2.0f * (float)M_PI / 7.0f);
-    dst[6] = cosf(dow * 2.0f * (float)M_PI / 7.0f);
-    if (src[5] < 0.0f)
-        dst[7] = -1.0f;
-    else
-        dst[7] = logf(1.0f + src[5] * 1440.0f) / logf(1.0f + 1440.0f);
-    dst[8] = src[6];
-    dst[9] = src[7];
-    dst[10] = src[8];
-    int packed = (src[9] >= 0.5f ? 1 : 0) + (src[10] >= 0.5f ? 2 : 0) + (src[11] >= 0.5f ? 4 : 0);
-    dst[11] = (float)packed / 7.0f;
-    dst[12] = src[12];
-    dst[13] = src[13];
+    for (int i = 0; i < DIM; i++) dst[i] = src[i];
     dst[14] = 0.0f;
     uint32_t meta = ((uint32_t)id << 1) | (uint32_t)fraud;
     memcpy(&dst[15], &meta, sizeof(float));
 }
 
+/* No-op: vectors from references are final; weights were for old transform space. */
 static void apply_weights(float *v) {
-    for (int i = 0; i < DIM; i++)
-        v[i] *= FEATURE_WEIGHTS[i];
+    (void)v;
 }
 
 static float manhattan_dist(const float *a, const float *b) {
