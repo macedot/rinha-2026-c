@@ -18,7 +18,7 @@
 #define N_PROBE_L1 32
 #define N_PROBE_L2 512
 #define N_PROBE_L2_EXTENDED 1024   /* higher coverage on the classic 256x256 structure */
-#define APPROVAL_THRESHOLD 0.445f  /* micro-experiment: slight relaxation on the 40-iter classic index to see how many of the remaining ~1097 errors are borderline */
+#define APPROVAL_THRESHOLD 0.44f
 #define CONFIDENCE_LOW 0.38f
 #define CONFIDENCE_HIGH 0.50f
 #define EARLY_EXIT_DIST 0.05f
