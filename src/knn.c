@@ -279,15 +279,9 @@ static inline int calculate_score(topk_t *topk, float *score_out) {
         return topk[0].label == 0;
     }
 
-    float fraud_weight = 0.0f;
-    float total_weight = 0.0f;
-    for (int i = 0; i < K_NEIGHBORS; i++) {
-        if (topk[i].dist >= 1e20f) continue;
-        float w = expf(-topk[i].dist * 0.5f);
-        total_weight += w;
-        fraud_weight += w * topk[i].label;
-    }
-    float score = (total_weight > 0.0f) ? (fraud_weight / total_weight) : 0.0f;
+    /* Pure ASM-style: unweighted fraction of frauds in top-K */
+    int f = fraud_count_in_topk(topk);
+    float score = (float)f / (float)K_NEIGHBORS;
     *score_out = score;
     return score < APPROVAL_THRESHOLD;
 }
