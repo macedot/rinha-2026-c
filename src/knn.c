@@ -33,19 +33,18 @@ static const float FEATURE_WEIGHTS[DIM] = {
     0.0f, 0.0f
 };
 
-/* --- Index data (mmap'd) --- */
+/* --- ASM 4-partition flat index (one flat 2048-cluster IVF per partition) --- */
 
 typedef struct {
-    float *l1_centroids;
-    float *l2_centroids;
-    uint32_t *offsets;
-    float *dataset;
+    float *centroids;   /* 2048 * 16 floats */
+    uint32_t *offsets;  /* 2049 u32 */
+    float *dataset;     /* n_part * 16 floats, label in [15] */
     int n_records;
-    void *l1_mmap, *l2_mmap, *off_mmap, *ds_mmap;
-    size_t l1_size, l2_size, off_size, ds_size;
-} hivf_t;
+    void *cent_mmap, *off_mmap, *ds_mmap;
+    size_t cent_size, off_size, ds_size;
+} part_t;
 
-static hivf_t g_index;
+static part_t g_parts[N_PARTITIONS];
 static int g_loaded = 0;
 
 static void *mmap_file(const char *path, size_t *size_out) {
@@ -65,31 +64,32 @@ static void *mmap_file(const char *path, size_t *size_out) {
 
 int rinha_load_index(const char *path) {
     char fp[1024];
+    int total_records = 0;
 
-    snprintf(fp, sizeof(fp), "%s/l1_centroids.bin", path);
-    g_index.l1_mmap = mmap_file(fp, &g_index.l1_size);
-    if (!g_index.l1_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-    g_index.l1_centroids = (float *)g_index.l1_mmap;
+    for (int t = 0; t < N_PARTITIONS; t++) {
+        part_t *p = &g_parts[t];
 
-    snprintf(fp, sizeof(fp), "%s/l2_centroids.bin", path);
-    g_index.l2_mmap = mmap_file(fp, &g_index.l2_size);
-    if (!g_index.l2_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-    g_index.l2_centroids = (float *)g_index.l2_mmap;
+        snprintf(fp, sizeof(fp), "%s/part%d_centroids.bin", path, t);
+        p->cent_mmap = mmap_file(fp, &p->cent_size);
+        if (!p->cent_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+        p->centroids = (float *)p->cent_mmap;
 
-    snprintf(fp, sizeof(fp), "%s/offsets.bin", path);
-    g_index.off_mmap = mmap_file(fp, &g_index.off_size);
-    if (!g_index.off_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-    g_index.offsets = (uint32_t *)g_index.off_mmap;
+        snprintf(fp, sizeof(fp), "%s/part%d_offsets.bin", path, t);
+        p->off_mmap = mmap_file(fp, &p->off_size);
+        if (!p->off_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+        p->offsets = (uint32_t *)p->off_mmap;
 
-    snprintf(fp, sizeof(fp), "%s/dataset.bin", path);
-    g_index.ds_mmap = mmap_file(fp, &g_index.ds_size);
-    if (!g_index.ds_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-    g_index.dataset = (float *)g_index.ds_mmap;
-    g_index.n_records = (int)(g_index.ds_size / (DIM * sizeof(float)));
+        snprintf(fp, sizeof(fp), "%s/part%d_dataset.bin", path, t);
+        p->ds_mmap = mmap_file(fp, &p->ds_size);
+        if (!p->ds_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+        p->dataset = (float *)p->ds_mmap;
+        p->n_records = (p->ds_size > 0) ? (int)(p->ds_size / (DIM * sizeof(float))) : 0;
+
+        total_records += p->n_records;
+    }
 
     g_loaded = 1;
-    fprintf(stderr, "HIVF loaded: %d records, L1=%d L2=%d offsets=%zu\n",
-            g_index.n_records, N_L1, N_TOTAL_L2, g_index.off_size / sizeof(uint32_t));
+    fprintf(stderr, "ASM 4-partition index loaded: %d total records (2048 clusters per part)\n", total_records);
     return 0;
 }
 
