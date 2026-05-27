@@ -15,7 +15,7 @@
 #define K_NEIGHBORS 5
 #define N_PARTITIONS 4
 #define N_CLUSTERS 2048
-#define NPROBE_INITIAL 64  /* very aggressive initial coverage with bbox pruning — cheap and helps the hardest cases */
+#define NPROBE_INITIAL 128  /* extremely aggressive initial coverage with bbox pruning (still fast). Goal: drive errors to zero. */
 #define NPROBE_REPAIR_MIN 1
 #define NPROBE_REPAIR_MAX 4
 #define SCALE 10000
