@@ -5,6 +5,10 @@
 #include <math.h>
 #include <ctype.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* Normalization constants (match Rust normalization.json) */
 static const float MAX_AMOUNT = 10000.0f;
 static const float MAX_INSTALLMENTS = 12.0f;
