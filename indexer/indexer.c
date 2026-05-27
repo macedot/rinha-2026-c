@@ -21,7 +21,7 @@
 #define N_L1 256
 #define N_L2_PER_L1 256
 #define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
-#define N_ITERATIONS 40  /* higher quality centroids for better recall on hard test cases */
+#define N_ITERATIONS 5  /* temporary low for quick docker/local build during port; will raise + add bbox for final 0/0 */
 
 /* ASM reference constants (full 4-partition 2048-cluster + bbox port in progress) */
 #define N_PARTITIONS 4
