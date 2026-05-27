@@ -207,6 +207,19 @@ static inline int fraud_count_in_topk(const topk_t *topk) {
     return cnt;
 }
 
+static inline float bbox_lb_manhattan(const part_t *part, int c, const float q[DIM]) {
+    float lb = 0.0f;
+    const float *mn = part->bbox_min + (size_t)c * DIM;
+    const float *mx = part->bbox_max + (size_t)c * DIM;
+    for (int d = 0; d < 14; d++) {  /* only first 14 dims matter */
+        float diff = 0.0f;
+        if (q[d] > mx[d]) diff = q[d] - mx[d];
+        else if (q[d] < mn[d]) diff = mn[d] - q[d];
+        lb += diff;
+    }
+    return lb;
+}
+
 static inline float scan_cluster_in_part(const part_t *part, int cluster_id,
                                          const float q[DIM], topk_t *topk, float max_dist) {
     if (cluster_id < 0 || cluster_id >= N_CLUSTERS) return max_dist;
@@ -297,13 +310,13 @@ int rinha_search(const float q_in[DIM], float *fraud_score_out) {
         return 1;
     }
 
-    /* Simple full centroid scan for this partition (2048) — bbox pruning comes next */
-    dist_idx_t c_dists[N_CLUSTERS];
+    /* ASM-style bbox lower-bound pruning + repair */
+    dist_idx_t lb_dists[N_CLUSTERS];
     for (int i = 0; i < N_CLUSTERS; i++) {
-        c_dists[i].dist = manhattan_scalar(q, part->centroids + (size_t)i * DIM);
-        c_dists[i].idx = i;
+        lb_dists[i].dist = bbox_lb_manhattan(part, i, q);
+        lb_dists[i].idx = i;
     }
-    qsort(c_dists, N_CLUSTERS, sizeof(dist_idx_t), cmp_dist_asc);
+    qsort(lb_dists, N_CLUSTERS, sizeof(dist_idx_t), cmp_dist_asc);
 
     topk_t topk[K_NEIGHBORS];
     for (int i = 0; i < K_NEIGHBORS; i++) {
@@ -314,15 +327,20 @@ int rinha_search(const float q_in[DIM], float *fraud_score_out) {
 
     int nprobe = NPROBE_INITIAL;
     for (int pi = 0; pi < nprobe && pi < N_CLUSTERS; pi++) {
-        max_dist = scan_cluster_in_part(part, c_dists[pi].idx, q, topk, max_dist);
+        int c = lb_dists[pi].idx;
+        /* Early skip if lb already worse than current worst in topk */
+        if (lb_dists[pi].dist >= max_dist) break;
+        max_dist = scan_cluster_in_part(part, c, q, topk, max_dist);
         if (topk[0].dist < EARLY_EXIT_DIST) break;
     }
 
     int fcnt = fraud_count_in_topk(topk);
     if (fcnt >= NPROBE_REPAIR_MIN && fcnt <= NPROBE_REPAIR_MAX) {
-        /* repair: extend significantly */
+        /* repair: continue with next best lb until full or decided */
         for (int pi = nprobe; pi < N_CLUSTERS; pi++) {
-            max_dist = scan_cluster_in_part(part, c_dists[pi].idx, q, topk, max_dist);
+            int c = lb_dists[pi].idx;
+            if (lb_dists[pi].dist >= max_dist) break;
+            max_dist = scan_cluster_in_part(part, c, q, topk, max_dist);
             if (topk[0].dist < EARLY_EXIT_DIST) break;
         }
     }
