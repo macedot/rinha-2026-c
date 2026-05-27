@@ -15,7 +15,7 @@
 #define K_NEIGHBORS 5
 #define N_PARTITIONS 4
 #define N_CLUSTERS 2048
-#define NPROBE_INITIAL 24  /* more initial coverage with bbox pruning (cheap); repair still handles ambiguous */
+#define NPROBE_INITIAL 48  /* aggressive initial coverage with cheap bbox pruning for the remaining hard cases */
 #define NPROBE_REPAIR_MIN 1
 #define NPROBE_REPAIR_MAX 4
 #define SCALE 10000
