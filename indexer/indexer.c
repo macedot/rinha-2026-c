@@ -21,7 +21,7 @@
 #define N_L1 256
 #define N_L2_PER_L1 256
 #define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
-#define N_ITERATIONS 40  /* higher quality for 0/0 on hard cases */
+#define N_ITERATIONS 80  /* very high quality clusters — final push for 0/0 on remaining hard cases */
 
 /* ASM reference constants (full 4-partition 2048-cluster + bbox port in progress) */
 #define N_PARTITIONS 4
