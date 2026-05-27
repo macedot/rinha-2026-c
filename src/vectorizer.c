@@ -40,52 +40,42 @@ static inline float clamp01(float v) {
     return v;
 }
 
-/* Accurate ISO8601 -> epoch seconds (UTC), ported from ASM reference to
- * guarantee bit-identical normalized features for queries vs references vectors.
- * Handles "YYYY-MM-DD[ T]hh:mm:ss[.fff][Z|±HH:MM]". Returns 0 on malformed. */
-static int64_t parse_iso8601(const char *s, size_t len) {
-    if (len < 19) return 0;
-    if (s[4] != '-' || s[7] != '-') return 0;
-    char sep = s[10];
-    if (sep != 'T' && sep != ' ') return 0;
-    if (s[13] != ':' || s[16] != ':') return 0;
+/* --- Timestamp parsing (original Rust-style, used to generate the test expectations) --- */
 
-    int y = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
-    int mo = (s[5]-'0')*10 + (s[6]-'0');
-    int da = (s[8]-'0')*10 + (s[9]-'0');
-    int hh = (s[11]-'0')*10 + (s[12]-'0');
-    int mi = (s[14]-'0')*10 + (s[15]-'0');
-    int se = (s[17]-'0')*10 + (s[18]-'0');
+static inline int parse_iso_hour(const char *s, size_t len) {
+    if (len < 13) return 0;
+    int h = (s[11] - '0') * 10 + (s[12] - '0');
+    return h;
+}
 
-    /* days_from_civil (Gregorian, matches ASM) */
-    int y2 = y - (mo <= 2 ? 1 : 0);
-    int era = (y2 >= 0 ? y2 : y2 - 399) / 400;
-    int yoe = y2 - era * 400;
-    int m2 = (mo > 2 ? mo - 3 : mo + 9);
-    int doy = (153 * m2 + 2) / 5 + da - 1;
-    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    int64_t days = (int64_t)era * 146097LL + doe - 719468LL;
-    int64_t epoch = days * 86400LL + (int64_t)hh * 3600 + (int64_t)mi * 60 + se;
+static inline int parse_iso_dow(const char *s, size_t len) {
+    if (len < 10) return 0;
+    int year = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+    int month = (s[5]-'0')*10 + (s[6]-'0');
+    int day = (s[8]-'0')*10 + (s[9]-'0');
 
-    /* optional .fff + TZ */
-    size_t p = 19;
-    if (p < len && s[p] == '.') {
-        p++;
-        while (p < len && s[p] >= '0' && s[p] <= '9') p++;
-    }
-    if (p < len) {
-        char c = s[p];
-        if (c == '+' || c == '-') {
-            if (p + 6 <= len && s[p + 3] == ':') {
-                int oh = (s[p+1]-'0')*10 + (s[p+2]-'0');
-                int om = (s[p+4]-'0')*10 + (s[p+5]-'0');
-                int64_t off = (int64_t)oh * 3600 + (int64_t)om * 60;
-                if (c == '+') epoch -= off; else epoch += off;
-            }
-        }
-        /* 'Z' or anything else: treat as UTC (no adjust) */
-    }
-    return epoch;
+    if (month < 1 || month > 12) return 0;
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    int y = year;
+    if (month < 3) y -= 1;
+    int dow = (y + y/4 - y/100 + y/400 + t[month-1] + day) % 7;
+    return (dow == 0) ? 6 : (dow - 1);
+}
+
+static inline int64_t iso_to_epoch_minutes(const char *s, size_t len) {
+    if (len < 16) return 0;
+    int year = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+    int month = (s[5]-'0')*10 + (s[6]-'0');
+    int day = (s[8]-'0')*10 + (s[9]-'0');
+    int hour = (s[11]-'0')*10 + (s[12]-'0');
+    int min = (s[14]-'0')*10 + (s[15]-'0');
+
+    int64_t total_days = (int64_t)(year - 2000) * 365 + (int64_t)(year - 2000) / 4;
+    static const int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    for (int i = 0; i < month - 1; i++) total_days += month_days[i];
+    if (month > 2 && year % 4 == 0) total_days += 1;
+    total_days += day;
+    return total_days * 1440 + hour * 60 + min;
 }
 
 /* --- Single-pass JSON parser (unchanged logic) --- */
@@ -254,70 +244,66 @@ int vectorizer_build(const char *body, size_t body_len, float out[VEC_DIM]) {
             mcc = mcc * 10 + (unsigned)(mcc_str[i] - '0');
     }
 
-    /* --- Compute 14-dim canonical normalized features (ASM/reference match) ---
-     * References.json "vector"[] already contains these exact values (linear norms,
-     * -1 sentinels for !has_last, separate 0/1 binaries, linear hour/dow, ratio=0 default).
-     * Must produce identical floats here for correct NN distances/labels. */
-    int64_t req_epoch = parse_iso8601(req_ts, req_ts_len);
-    int64_t last_epoch = (has_last_tx && last_ts_len >= 19) ? parse_iso8601(last_ts, last_ts_len) : 0;
+    /* --- Compute new 16-dim feature vector (original Rust-style that generated the test expectations) --- */
 
-    /* hour [0,23], dow [0,6] from epoch (1970-01-01 was Thu; matches ASM) */
-    int64_t days_since = req_epoch / 86400;
-    int dow = (int)((days_since + 3) % 7 + 7) % 7;
-    int hour = (int)((req_epoch / 3600) % 24 + 24) % 24;
+    // 0. ln(1 + amount) / ln(1 + max_amount)
+    out[0] = logf(1.0f + amount) / logf(1.0f + MAX_AMOUNT);
 
-    // 0. amount / 10000 (linear, not log)
-    out[0] = clamp01(amount / MAX_AMOUNT);
-
-    // 1. installments / 12
+    // 1. installments / max_installments
     out[1] = clamp01(installments / MAX_INSTALLMENTS);
 
-    // 2. (amount / cust_avg / 10) or 0 (ASM default, not 1.0)
+    // 2. amount_vs_avg_ratio
     float ratio = (customer_avg_amount > 0.0f)
         ? (amount / customer_avg_amount) / MAX_AVG_RATIO
-        : 0.0f;
+        : 1.0f;
     out[2] = clamp01(ratio);
 
-    // 3. hour / 23 (linear)
-    out[3] = clamp01((float)hour / 23.0f);
+    // 3. hour_sin, 4. hour_cos
+    int hour = parse_iso_hour(req_ts, req_ts_len);
+    int dow = parse_iso_dow(req_ts, req_ts_len);
+    float hour_rad = hour * 2.0f * (float)M_PI / 24.0f;
+    float day_rad = dow * 2.0f * (float)M_PI / 7.0f;
+    out[3] = sinf(hour_rad);
+    out[4] = cosf(hour_rad);
 
-    // 4. dow / 6 (linear)
-    out[4] = clamp01((float)dow / 6.0f);
+    // 5. day_sin, 6. day_cos
+    out[5] = sinf(day_rad);
+    out[6] = cosf(day_rad);
 
-    // 5. (ts - last_ts)/60 /1440 or -1 ; 6. km_last or -1
+    // 7. ln(1 + minutes) / ln(1 + max_minutes)
+    // 8. km_from_last_tx
     if (has_last_tx) {
-        double diff_sec = (double)(req_epoch - last_epoch);
-        if (diff_sec < 0) diff_sec = -diff_sec;
-        float min_norm = (float)(diff_sec / 60.0 / 1440.0);
-        out[5] = clamp01(min_norm);
-        out[6] = clamp01(km_from_current / MAX_KM);
+        int64_t req_mins = iso_to_epoch_minutes(req_ts, req_ts_len);
+        int64_t last_mins = iso_to_epoch_minutes(last_ts, last_ts_len);
+        int64_t diff = req_mins - last_mins;
+        if (diff < 0) diff = -diff;
+        out[7] = logf(1.0f + (float)diff) / logf(1.0f + MAX_MINUTES);
+        out[8] = clamp01(km_from_current / MAX_KM);
     } else {
-        out[5] = -1.0f;
-        out[6] = -1.0f;
+        out[7] = -1.0f;
+        out[8] = -1.0f;
     }
 
-    // 7. km_from_home / 1000
-    out[7] = clamp01(km_from_home / MAX_KM);
+    // 9. km_from_home
+    out[9] = clamp01(km_from_home / MAX_KM);
 
-    // 8. tx_count_24h / 20
-    out[8] = clamp01(tx_count_24h / MAX_TX_COUNT);
+    // 10. tx_count_24h
+    out[10] = clamp01(tx_count_24h / MAX_TX_COUNT);
 
-    // 9. is_online ? 1 : 0
-    out[9] = is_online ? 1.0f : 0.0f;
+    // 11. Packed binary: (online + 2*card + 4*unknown) / 7
+    float packed = 0.0f;
+    if (is_online) packed += 1.0f;
+    if (card_present) packed += 2.0f;
+    if (!known_merchant) packed += 4.0f;
+    out[11] = packed / 7.0f;
 
-    // 10. card_present ? 1 : 0
-    out[10] = card_present ? 1.0f : 0.0f;
-
-    // 11. unknown_merchant ? 1 : 0   (note: inverted from known)
-    out[11] = known_merchant ? 0.0f : 1.0f;
-
-    // 12. mcc_risk (must match exactly what references stored for this MCC)
+    // 12. mcc_risk
     out[12] = (mcc < 65536) ? mcc_risks[mcc] : 0.5f;
 
-    // 13. merchant_avg / 10000
+    // 13. merchant_avg_amount
     out[13] = clamp01(merchant_avg_amount / MAX_MERCHANT_AVG);
 
-    // 14,15 padding (label packed at runtime in knn for index records only)
+    // 14, 15. padding / placeholder
     out[14] = 0.0f;
     out[15] = 0.0f;
 
