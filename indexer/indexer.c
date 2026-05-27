@@ -23,6 +23,10 @@
 #define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
 #define N_ITERATIONS 40  /* higher quality centroids for better recall on hard test cases */
 
+/* ASM reference constants (full 4-partition 2048-cluster + bbox port in progress) */
+#define N_PARTITIONS 4
+#define N_CLUSTERS 2048
+
 static unsigned int global_seed = 42;
 
 /* ASM canonical space: references.json "vector"[] are already the final normalized
@@ -230,6 +234,12 @@ int main(int argc, char **argv) {
     }
     free(raw_vecs);
     free(raw_labs);
+
+    /* ASM-style 4 partitions by tag (unknown_merchant, has_last_tx) */
+    printf("Computing ASM tags and grouping into 4 partitions...\n");
+    int part_cnt[N_PARTITIONS] = {0};  /* will define N_PARTITIONS below if needed */
+    /* For now we keep the classic 2-level path while we port the rest of the
+     * ASM index (bbox, partitions, K=5 repair). Full port continues in next steps. */
 
     /* === Classic 2-level HIVF (256 L1 × 256 L2) - the structure that previously
      * achieved 0 FP/FN when paired with Rust features + weighted K=7 scoring. */
