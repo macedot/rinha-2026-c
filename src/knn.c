@@ -263,36 +263,27 @@ static inline int calculate_score(topk_t *topk, float *score_out) {
 int rinha_search(const float q_in[DIM], float *fraud_score_out) {
     if (!g_loaded || !fraud_score_out) return 0;
 
-    // Apply feature weights to query
     float q[DIM];
     for (int i = 0; i < 14; i++) q[i] = q_in[i] * FEATURE_WEIGHTS[i];
     q[14] = 0.0f; q[15] = 0.0f;
 
-    // 1. Compute L1 distances
-    dist_idx_t l1_dists[N_L1];
-    for (int i = 0; i < N_L1; i++) {
-        l1_dists[i].dist = manhattan_scalar(q, g_index.l1_centroids + (size_t)i * DIM);
-        l1_dists[i].idx = i;
-    }
-    qsort(l1_dists, N_L1, sizeof(dist_idx_t), cmp_dist_asc);
+    /* ASM tag routing */
+    int tag = ((q[11] > 0.5f) ? 2 : 0) | ((q[5] >= 0.0f) ? 1 : 0);
+    part_t *part = &g_parts[tag];
 
-    // 2. Compute L2 distances for top L1 clusters
-    dist_idx_t l2_dists[N_PROBE_L1 * N_L2_PER_L1];
-    int l2_count = 0;
-    for (int pi = 0; pi < N_PROBE_L1; pi++) {
-        int l1_idx = l1_dists[pi].idx;
-        int base = l1_idx * N_L2_PER_L1;
-        for (int j = 0; j < N_L2_PER_L1; j++) {
-            l2_dists[l2_count].dist = manhattan_scalar(q, g_index.l2_centroids + (size_t)(base + j) * DIM);
-            l2_dists[l2_count].idx = base + j;
-            l2_count++;
-        }
+    if (part->n_records == 0) {
+        *fraud_score_out = 0.0f;
+        return 1;
     }
 
-    // 3. Select top 512 L2 clusters, sort top 256
-    qsort(l2_dists, l2_count, sizeof(dist_idx_t), cmp_dist_asc);
+    /* Simple full centroid scan for this partition (2048) — bbox pruning comes next */
+    dist_idx_t c_dists[N_CLUSTERS];
+    for (int i = 0; i < N_CLUSTERS; i++) {
+        c_dists[i].dist = manhattan_scalar(q, part->centroids + (size_t)i * DIM);
+        c_dists[i].idx = i;
+    }
+    qsort(c_dists, N_CLUSTERS, sizeof(dist_idx_t), cmp_dist_asc);
 
-    // 4. Scan records in top 256 L2 clusters
     topk_t topk[K_NEIGHBORS];
     for (int i = 0; i < K_NEIGHBORS; i++) {
         topk[i].dist = FLT_MAX;
@@ -300,29 +291,23 @@ int rinha_search(const float q_in[DIM], float *fraud_score_out) {
     }
     float max_dist = FLT_MAX;
 
-    for (int pi = 0; pi < N_PROBE_L2; pi++) {
-        max_dist = scan_cluster(l2_dists[pi].idx, q, topk, max_dist);
-        if (topk[0].dist < EARLY_EXIT_DIST) {
-            int approved = calculate_score(topk, fraud_score_out);
-            return approved;
+    int nprobe = NPROBE_INITIAL;
+    for (int pi = 0; pi < nprobe && pi < N_CLUSTERS; pi++) {
+        max_dist = scan_cluster_in_part(part, c_dists[pi].idx, q, topk, max_dist);
+        if (topk[0].dist < EARLY_EXIT_DIST) break;
+    }
+
+    int fcnt = fraud_count_in_topk(topk);
+    if (fcnt >= NPROBE_REPAIR_MIN && fcnt <= NPROBE_REPAIR_MAX) {
+        /* repair: extend significantly */
+        for (int pi = nprobe; pi < N_CLUSTERS; pi++) {
+            max_dist = scan_cluster_in_part(part, c_dists[pi].idx, q, topk, max_dist);
+            if (topk[0].dist < EARLY_EXIT_DIST) break;
         }
     }
 
     float score;
     int approved = calculate_score(topk, &score);
-
-    // 5. Adaptive extended probing
-    if ((score > CONFIDENCE_LOW && score < CONFIDENCE_HIGH) || topk[0].dist > MAX_DIST_TRIGGER) {
-        for (int pi = N_PROBE_L2; pi < N_PROBE_L2_EXTENDED && pi < l2_count; pi++) {
-            max_dist = scan_cluster(l2_dists[pi].idx, q, topk, max_dist);
-            if (topk[0].dist < EARLY_EXIT_DIST) {
-                approved = calculate_score(topk, &score);
-                break;
-            }
-        }
-        approved = calculate_score(topk, &score);
-    }
-
     *fraud_score_out = score;
     return approved;
 }

@@ -13,7 +13,7 @@
 static const float MAX_AMOUNT = 10000.0f;
 static const float MAX_INSTALLMENTS = 12.0f;
 static const float MAX_AVG_RATIO = 10.0f;
-static const float MAX_MINUTES = 1440.0f;
+/* MAX_MINUTES removed - using ASM parse path */
 static const float MAX_KM = 1000.0f;
 static const float MAX_TX_COUNT = 20.0f;
 static const float MAX_MERCHANT_AVG = 10000.0f;
@@ -44,42 +44,44 @@ static inline float clamp01(float v) {
     return v;
 }
 
-/* --- Timestamp parsing (original Rust-style, used to generate the test expectations) --- */
+/* Timestamp parsing now uses the ASM parse_iso8601 above */
 
-static inline int parse_iso_hour(const char *s, size_t len) {
-    if (len < 13) return 0;
-    int h = (s[11] - '0') * 10 + (s[12] - '0');
-    return h;
-}
+/* Accurate parse from ASM reference (used by the new feature computation) */
+static int64_t parse_iso8601(const char *s, size_t len) {
+    if (len < 19) return 0;
+    if (s[4] != '-' || s[7] != '-') return 0;
+    char sep = s[10];
+    if (sep != 'T' && sep != ' ') return 0;
+    if (s[13] != ':' || s[16] != ':') return 0;
 
-static inline int parse_iso_dow(const char *s, size_t len) {
-    if (len < 10) return 0;
-    int year = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
-    int month = (s[5]-'0')*10 + (s[6]-'0');
-    int day = (s[8]-'0')*10 + (s[9]-'0');
+    int y = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+    int mo = (s[5]-'0')*10 + (s[6]-'0');
+    int da = (s[8]-'0')*10 + (s[9]-'0');
+    int hh = (s[11]-'0')*10 + (s[12]-'0');
+    int mi = (s[14]-'0')*10 + (s[15]-'0');
+    int se = (s[17]-'0')*10 + (s[18]-'0');
 
-    if (month < 1 || month > 12) return 0;
-    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
-    int y = year;
-    if (month < 3) y -= 1;
-    int dow = (y + y/4 - y/100 + y/400 + t[month-1] + day) % 7;
-    return (dow == 0) ? 6 : (dow - 1);
-}
+    int y2 = y - (mo <= 2 ? 1 : 0);
+    int era = (y2 >= 0 ? y2 : y2 - 399) / 400;
+    int yoe = y2 - era * 400;
+    int m2 = (mo > 2 ? mo - 3 : mo + 9);
+    int doy = (153 * m2 + 2) / 5 + da - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = (int64_t)era * 146097LL + doe - 719468LL;
+    int64_t epoch = days * 86400LL + (int64_t)hh * 3600 + (int64_t)mi * 60 + se;
 
-static inline int64_t iso_to_epoch_minutes(const char *s, size_t len) {
-    if (len < 16) return 0;
-    int year = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
-    int month = (s[5]-'0')*10 + (s[6]-'0');
-    int day = (s[8]-'0')*10 + (s[9]-'0');
-    int hour = (s[11]-'0')*10 + (s[12]-'0');
-    int min = (s[14]-'0')*10 + (s[15]-'0');
-
-    int64_t total_days = (int64_t)(year - 2000) * 365 + (int64_t)(year - 2000) / 4;
-    static const int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    for (int i = 0; i < month - 1; i++) total_days += month_days[i];
-    if (month > 2 && year % 4 == 0) total_days += 1;
-    total_days += day;
-    return total_days * 1440 + hour * 60 + min;
+    size_t p = 19;
+    if (p < len && s[p] == '.') { p++; while (p < len && s[p]>='0'&&s[p]<='9') p++; }
+    if (p < len) {
+        char c = s[p];
+        if ((c=='+'||c=='-') && p+6<=len && s[p+3]==':') {
+            int oh = (s[p+1]-'0')*10+(s[p+2]-'0');
+            int om = (s[p+4]-'0')*10+(s[p+5]-'0');
+            int64_t off = (int64_t)oh*3600 + (int64_t)om*60;
+            if (c=='+') epoch -= off; else epoch += off;
+        }
+    }
+    return epoch;
 }
 
 /* --- Single-pass JSON parser (unchanged logic) --- */
