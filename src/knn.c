@@ -12,34 +12,37 @@
 
 #define DIM 16
 #define K_NEIGHBORS 7
-#define N_PARTITIONS 4
-#define N_CLUSTERS 2048
-#define N_PROBE 32
+#define N_L1 256
+#define N_L2_PER_L1 256
+#define N_TOTAL_L2 (N_L1 * N_L2_PER_L1)
+#define N_PROBE_L1 16
+#define N_PROBE_L2 256
+#define N_PROBE_L2_EXTENDED 512
 #define APPROVAL_THRESHOLD 0.44f
 #define CONFIDENCE_LOW 0.38f
 #define CONFIDENCE_HIGH 0.50f
 #define EARLY_EXIT_DIST 0.05f
 #define MAX_DIST_TRIGGER 1.5f
 
-/* All 1.0: canonical normalized features need no extra per-dim weighting (ASM-style) */
 static const float FEATURE_WEIGHTS[DIM] = {
-    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0038165f, 0.665417f, 0.8668326f, 0.5379362f, 0.5f, 0.3f, 0.3701757f,
+    1.0f, 1.2f, 1.2648705f, 0.81239825f, 1.051987f, 0.8247206f, 2.0315619f,
     0.0f, 0.0f
 };
 
-/* --- 4-partition flat IVF index (mmap'd) --- */
+/* --- Index data (mmap'd) --- */
 
 typedef struct {
-    float *centroids;   /* N_CLUSTERS * DIM floats */
-    uint32_t *offsets;  /* (N_CLUSTERS + 1) u32 */
-    float *dataset;     /* n_part * DIM floats, label packed into [15] */
+    float *l1_centroids;
+    float *l2_centroids;
+    uint32_t *offsets;
+    float *dataset;
     int n_records;
-    void *cent_mmap, *off_mmap, *ds_mmap;
-    size_t cent_size, off_size, ds_size;
-} flat_part_t;
+    void *l1_mmap, *l2_mmap, *off_mmap, *ds_mmap;
+    size_t l1_size, l2_size, off_size, ds_size;
+} hivf_t;
 
-static flat_part_t g_parts[N_PARTITIONS];
+static hivf_t g_index;
 static int g_loaded = 0;
 
 static void *mmap_file(const char *path, size_t *size_out) {
@@ -59,32 +62,31 @@ static void *mmap_file(const char *path, size_t *size_out) {
 
 int rinha_load_index(const char *path) {
     char fp[1024];
-    int total = 0;
 
-    for (int t = 0; t < N_PARTITIONS; t++) {
-        flat_part_t *p = &g_parts[t];
+    snprintf(fp, sizeof(fp), "%s/l1_centroids.bin", path);
+    g_index.l1_mmap = mmap_file(fp, &g_index.l1_size);
+    if (!g_index.l1_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+    g_index.l1_centroids = (float *)g_index.l1_mmap;
 
-        snprintf(fp, sizeof(fp), "%s/part%d_centroids.bin", path, t);
-        p->cent_mmap = mmap_file(fp, &p->cent_size);
-        if (!p->cent_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-        p->centroids = (float *)p->cent_mmap;
+    snprintf(fp, sizeof(fp), "%s/l2_centroids.bin", path);
+    g_index.l2_mmap = mmap_file(fp, &g_index.l2_size);
+    if (!g_index.l2_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+    g_index.l2_centroids = (float *)g_index.l2_mmap;
 
-        snprintf(fp, sizeof(fp), "%s/part%d_offsets.bin", path, t);
-        p->off_mmap = mmap_file(fp, &p->off_size);
-        if (!p->off_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-        p->offsets = (uint32_t *)p->off_mmap;
+    snprintf(fp, sizeof(fp), "%s/offsets.bin", path);
+    g_index.off_mmap = mmap_file(fp, &g_index.off_size);
+    if (!g_index.off_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+    g_index.offsets = (uint32_t *)g_index.off_mmap;
 
-        snprintf(fp, sizeof(fp), "%s/part%d_dataset.bin", path, t);
-        p->ds_mmap = mmap_file(fp, &p->ds_size);
-        if (!p->ds_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-        p->dataset = (float *)p->ds_mmap;
-        p->n_records = (p->ds_size > 0) ? (int)(p->ds_size / (DIM * sizeof(float))) : 0;
-
-        total += p->n_records;
-    }
+    snprintf(fp, sizeof(fp), "%s/dataset.bin", path);
+    g_index.ds_mmap = mmap_file(fp, &g_index.ds_size);
+    if (!g_index.ds_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+    g_index.dataset = (float *)g_index.ds_mmap;
+    g_index.n_records = (int)(g_index.ds_size / (DIM * sizeof(float)));
 
     g_loaded = 1;
-    fprintf(stderr, "Loaded 4 partitions, total %d records (flat IVF, 2048 clusters/part)\n", total);
+    fprintf(stderr, "HIVF loaded: %d records, L1=%d L2=%d offsets=%zu\n",
+            g_index.n_records, N_L1, N_TOTAL_L2, g_index.off_size / sizeof(uint32_t));
     return 0;
 }
 
@@ -180,16 +182,15 @@ static int cmp_dist_asc(const void *a, const void *b) {
     return (da < db) ? -1 : (da > db) ? 1 : 0;
 }
 
-/* --- Scan cluster records (flat per-partition) --- */
+/* --- Scan cluster records --- */
 
-static inline float scan_cluster_in_part(const flat_part_t *part, int cluster_id,
-                                         const float q[DIM], topk_t *topk, float max_dist) {
-    if (cluster_id < 0 || cluster_id >= N_CLUSTERS) return max_dist;
-    uint32_t start = part->offsets[cluster_id];
-    uint32_t end = part->offsets[cluster_id + 1];
+static inline float scan_cluster(int l2_idx, const float q[DIM],
+                                  topk_t *topk, float max_dist) {
+    uint32_t start = g_index.offsets[l2_idx];
+    uint32_t end = g_index.offsets[l2_idx + 1];
     if (end <= start) return max_dist;
 
-    const float *records = part->dataset + (size_t)start * DIM;
+    const float *records = g_index.dataset + (size_t)start * DIM;
     int n = (int)(end - start);
 
 #ifdef __AVX2__
@@ -233,15 +234,7 @@ static inline float scan_cluster_in_part(const flat_part_t *part, int cluster_id
     return max_dist;
 }
 
-/* --- Compute fraud score from top-k (unweighted count/K, matches expected 0/0.2/.../1) --- */
-
-static inline int fraud_count_in_topk(const topk_t *topk) {
-    int cnt = 0;
-    for (int i = 0; i < K_NEIGHBORS; i++) {
-        if (topk[i].dist < 1e20f && topk[i].label) cnt++;
-    }
-    return cnt;
-}
+/* --- Compute fraud score from top-k --- */
 
 static inline int calculate_score(topk_t *topk, float *score_out) {
     if (topk[0].dist < EARLY_EXIT_DIST) {
@@ -262,36 +255,41 @@ static inline int calculate_score(topk_t *topk, float *score_out) {
     return score < APPROVAL_THRESHOLD;
 }
 
-/* --- Main search (tag-partitioned flat IVF) --- */
+/* --- Main search --- */
 
 int rinha_search(const float q_in[DIM], float *fraud_score_out) {
     if (!g_loaded || !fraud_score_out) return 0;
 
-    /* Apply weights (identity) and zero padding */
+    // Apply feature weights to query
     float q[DIM];
     for (int i = 0; i < 14; i++) q[i] = q_in[i] * FEATURE_WEIGHTS[i];
     q[14] = 0.0f; q[15] = 0.0f;
 
-    /* Tag from canonical features (must match indexer & ASM ref) */
-    float tagf5 = q[5];
-    float tagf11 = q[11];
-    int tag = ((tagf11 > 0.5f) ? 2 : 0) | ((tagf5 >= 0.0f) ? 1 : 0);
+    // 1. Compute L1 distances
+    dist_idx_t l1_dists[N_L1];
+    for (int i = 0; i < N_L1; i++) {
+        l1_dists[i].dist = manhattan_scalar(q, g_index.l1_centroids + (size_t)i * DIM);
+        l1_dists[i].idx = i;
+    }
+    qsort(l1_dists, N_L1, sizeof(dist_idx_t), cmp_dist_asc);
 
-    flat_part_t *part = &g_parts[tag];
-    if (part->n_records == 0) {
-        *fraud_score_out = 0.0f;
-        return 1; /* conservative; real data has all tags populated */
+    // 2. Compute L2 distances for top L1 clusters
+    dist_idx_t l2_dists[N_PROBE_L1 * N_L2_PER_L1];
+    int l2_count = 0;
+    for (int pi = 0; pi < N_PROBE_L1; pi++) {
+        int l1_idx = l1_dists[pi].idx;
+        int base = l1_idx * N_L2_PER_L1;
+        for (int j = 0; j < N_L2_PER_L1; j++) {
+            l2_dists[l2_count].dist = manhattan_scalar(q, g_index.l2_centroids + (size_t)(base + j) * DIM);
+            l2_dists[l2_count].idx = base + j;
+            l2_count++;
+        }
     }
 
-    /* 1. Distances to all 2048 centroids of the owning partition */
-    dist_idx_t c_dists[N_CLUSTERS];
-    for (int i = 0; i < N_CLUSTERS; i++) {
-        c_dists[i].dist = manhattan_scalar(q, part->centroids + (size_t)i * DIM);
-        c_dists[i].idx = i;
-    }
-    qsort(c_dists, N_CLUSTERS, sizeof(dist_idx_t), cmp_dist_asc);
+    // 3. Select top 512 L2 clusters, sort top 256
+    qsort(l2_dists, l2_count, sizeof(dist_idx_t), cmp_dist_asc);
 
-    /* 2. Init top-K */
+    // 4. Scan records in top 256 L2 clusters
     topk_t topk[K_NEIGHBORS];
     for (int i = 0; i < K_NEIGHBORS; i++) {
         topk[i].dist = FLT_MAX;
@@ -299,34 +297,25 @@ int rinha_search(const float q_in[DIM], float *fraud_score_out) {
     }
     float max_dist = FLT_MAX;
 
-    /* 3. Probe initial N_PROBE clusters (AVX accelerated scans) */
-    int max_probe = N_PROBE;
-    if (max_probe > N_CLUSTERS) max_probe = N_CLUSTERS;
-    for (int pi = 0; pi < max_probe; pi++) {
-        max_dist = scan_cluster_in_part(part, c_dists[pi].idx, q, topk, max_dist);
+    for (int pi = 0; pi < N_PROBE_L2; pi++) {
+        max_dist = scan_cluster(l2_dists[pi].idx, q, topk, max_dist);
         if (topk[0].dist < EARLY_EXIT_DIST) {
-            return calculate_score(topk, fraud_score_out);
+            int approved = calculate_score(topk, fraud_score_out);
+            return approved;
         }
     }
 
     float score;
     int approved = calculate_score(topk, &score);
 
-    /* 4. Original adaptive extended probing (confidence zone or poor NN match).
-     * Combined with 4-partition index + Rust features for best chance at 0/0. */
+    // 5. Adaptive extended probing
     if ((score > CONFIDENCE_LOW && score < CONFIDENCE_HIGH) || topk[0].dist > MAX_DIST_TRIGGER) {
-        int maxp = N_CLUSTERS;
-        for (int pi = N_PROBE; pi < maxp; pi++) {
-            max_dist = scan_cluster_in_part(part, c_dists[pi].idx, q, topk, max_dist);
+        for (int pi = N_PROBE_L2; pi < N_PROBE_L2_EXTENDED && pi < l2_count; pi++) {
+            max_dist = scan_cluster(l2_dists[pi].idx, q, topk, max_dist);
             if (topk[0].dist < EARLY_EXIT_DIST) {
                 approved = calculate_score(topk, &score);
                 break;
             }
-        }
-        approved = calculate_score(topk, &score);
-    }
-        for (int pi = N_PROBE + medium; pi < maxp; pi++) {
-            max_dist = scan_cluster_in_part(part, c_dists[pi].idx, q, topk, max_dist);
         }
         approved = calculate_score(topk, &score);
     }
