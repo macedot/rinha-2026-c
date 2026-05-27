@@ -39,9 +39,11 @@ typedef struct {
     float *centroids;   /* 2048 * 16 floats */
     uint32_t *offsets;  /* 2049 u32 */
     float *dataset;     /* n_part * 16 floats, label in [15] */
+    float *bbox_min;    /* 2048 * 16 floats */
+    float *bbox_max;    /* 2048 * 16 floats */
     int n_records;
-    void *cent_mmap, *off_mmap, *ds_mmap;
-    size_t cent_size, off_size, ds_size;
+    void *cent_mmap, *off_mmap, *ds_mmap, *bmin_mmap, *bmax_mmap;
+    size_t cent_size, off_size, ds_size, bmin_size, bmax_size;
 } part_t;
 
 static part_t g_parts[N_PARTITIONS];
@@ -84,6 +86,16 @@ int rinha_load_index(const char *path) {
         if (!p->ds_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
         p->dataset = (float *)p->ds_mmap;
         p->n_records = (p->ds_size > 0) ? (int)(p->ds_size / (DIM * sizeof(float))) : 0;
+
+        snprintf(fp, sizeof(fp), "%s/part%d_bbox_min.bin", path, t);
+        p->bmin_mmap = mmap_file(fp, &p->bmin_size);
+        if (!p->bmin_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+        p->bbox_min = (float *)p->bmin_mmap;
+
+        snprintf(fp, sizeof(fp), "%s/part%d_bbox_max.bin", path, t);
+        p->bmax_mmap = mmap_file(fp, &p->bmax_size);
+        if (!p->bmax_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+        p->bbox_max = (float *)p->bmax_mmap;
 
         total_records += p->n_records;
     }
