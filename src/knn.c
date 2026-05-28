@@ -17,7 +17,7 @@
 #define N_PARTITIONS 4
 #define N_CLUSTERS 2048
 /* Exact constants from the ASM reference (macros.inc) for fidelity */
-#define NPROBE_INITIAL     12   /* small initial budget — repair does the heavy lifting on hard cases */
+#define NPROBE_INITIAL     8    /* experimental: trying lower value for latency (full validation required) */
 #define NPROBE_REPAIR_MIN  1
 #define NPROBE_REPAIR_MAX  4
 #define SCALE 10000
