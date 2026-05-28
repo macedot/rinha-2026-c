@@ -8,13 +8,18 @@ COPY Makefile Makefile
 COPY src/ src/
 COPY indexer/ indexer/
 COPY resources/ resources/
+# Copy pre-generated i16 index if present in the build context (the normal fast path).
+# This makes `docker compose build` complete in seconds instead of 20+ minutes.
+# The good zero-error index (data/part*_data_i16.bin + labels + i16 bbox) is committed in git.
+COPY data/ data/
 
 ARG INPUT_FILE=resources/references.json.gz
-# Fast path for docker compose: pre-generate part*.bin locally once and they are picked up.
-# The RUN below still executes (so main "builds it"), but you can lower iters for CI speed
-# by editing N_ITERATIONS temporarily or using a build arg in future.
-RUN make indexer/indexer && \
-    indexer/indexer $INPUT_FILE data && \
+# Only run the indexer if the required i16 output files are missing.
+# This supports both "fast docker build with committed index" and "full re-index from source".
+RUN if [ ! -f data/part0_data_i16.bin ] || [ ! -f data/part0_labels.bin ]; then \
+        make indexer/indexer && \
+        indexer/indexer $INPUT_FILE data; \
+    fi && \
     make
 
 FROM debian:trixie-slim AS server
