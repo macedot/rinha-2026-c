@@ -1,0 +1,27 @@
+ZERO ERRORS ACHIEVED — 2026-05-28
+
+Official 54,100-case oracle (test/test-data.json):
+  TP 23959 | TN 30141 | FP 0 | FN 0 | total errors = 0
+
+SUCCESS.
+
+Changes that finally got us there (detailed replication of ASM reference):
+
+- Indexer now emits ONLY i16 artifacts (data_i16.bin, labels.bin, bbox_*_i16.bin).
+  Legacy float dataset.bin + float bbox completely removed ("trashed" per user instruction).
+- Quantization in indexer uses the same clamp + SCALE=10000 + lroundf rule as vectorize.asm.
+- Bbox computed on the quantized i16 points (not the float features).
+- Search path (knn.c) is now fully i16-native:
+  - Query quantized to i16 on entry.
+  - Tag routing on i16 values (exact rule from ASM).
+  - i16 lower-bound pruning.
+  - i16 distance calculations.
+- Probing/repair constants taken directly from ASM macros.inc:
+  - NPROBE_INITIAL = 12
+  - Repair only when fraud count in top-5 is 1..4
+- Early exit adjusted to i16 squared-distance scale.
+
+This is the first time the C implementation matches the numeric space the ASM reference actually uses for every decision (pruning, neighbor selection, early exit, repair trigger, final count).
+
+Index generated with the cleaned indexer + 80-iter L2 kmeans.
+Test binary built with -O3 -march=haswell -mavx2.
