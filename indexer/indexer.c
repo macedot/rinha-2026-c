@@ -317,7 +317,7 @@ int main(int argc, char **argv) {
             memcpy(psorted + (size_t)idx * OUT_DIM, pd + (size_t)j * OUT_DIM, OUT_DIM * sizeof(float));
         }
 
-        /* Write per-partition files (centroids + offsets + dataset for now; bbox later) */
+        /* Write per-partition files — i16 quantized data is the truth for search fidelity */
         char path[4096];
         FILE *fp;
         snprintf(path, sizeof(path), "%s/part%d_centroids.bin", argv[2], t);
@@ -330,16 +330,12 @@ int main(int argc, char **argv) {
         fwrite(poff, sizeof(uint32_t), (size_t)N_CLUSTERS + 1, fp);
         fclose(fp);
 
-        snprintf(path, sizeof(path), "%s/part%d_dataset.bin", argv[2], t);
-        fp = fopen(path, "wb");
-        fwrite(psorted, sizeof(float), (size_t)pn * OUT_DIM, fp);
-        fclose(fp);
+        /* We no longer write the legacy float dataset.bin or float bbox.
+         * The i16 versions below are what the search path will use. */
+        printf("Partition %d: %d records, 2048 clusters written (i16 data)\n", t, pn);
 
-        printf("Partition %d: %d records, 2048 clusters written\n", t, pn);
-
-        /* Fidelity: emit i16 quantized data + separate labels + i16 bbox (computed on
-         * the quantized points). Float dataset + float bbox still written below so the
-         * old knn path continues to work during the transition. */
+        /* Emit the i16 quantized data + labels + bbox that the search path will actually use.
+         * This matches the numeric space used by the ASM reference (vectorize.asm + search.asm). */
         int16_t *qdata = (int16_t *)malloc((size_t)pn * DIM * sizeof(int16_t));
         uint8_t *qlabels = (uint8_t *)malloc((size_t)pn);
         for (int j = 0; j < pn; j++) {
@@ -402,42 +398,6 @@ int main(int argc, char **argv) {
         free(bmax16);
         free(qlabels);
         free(qdata);
-
-        /* Legacy float bbox (kept for now so old knn path still works) */
-        float *bmin = (float *)malloc((size_t)N_CLUSTERS * DIM * sizeof(float));
-        float *bmax = (float *)malloc((size_t)N_CLUSTERS * DIM * sizeof(float));
-        for (int c = 0; c < N_CLUSTERS; c++) {
-            for (int d = 0; d < DIM; d++) {
-                bmin[c*DIM + d] = 1e30f;
-                bmax[c*DIM + d] = -1e30f;
-            }
-        }
-        for (int c = 0; c < N_CLUSTERS; c++) {
-            uint32_t start = poff[c];
-            uint32_t end = poff[c+1];
-            for (uint32_t i = start; i < end; i++) {
-                const float *v = psorted + (size_t)i * OUT_DIM;
-                for (int d = 0; d < DIM; d++) {
-                    if (v[d] < bmin[c*DIM + d]) bmin[c*DIM + d] = v[d];
-                    if (v[d] > bmax[c*DIM + d]) bmax[c*DIM + d] = v[d];
-                }
-            }
-        }
-
-        snprintf(bpath, sizeof(bpath), "%s/part%d_bbox_min.bin", argv[2], t);
-        bfp = fopen(bpath, "wb");
-        fwrite(bmin, sizeof(float), (size_t)N_CLUSTERS * DIM, bfp);
-        fclose(bfp);
-
-        snprintf(bpath, sizeof(bpath), "%s/part%d_bbox_max.bin", argv[2], t);
-        bfp = fopen(bpath, "wb");
-        fwrite(bmax, sizeof(float), (size_t)N_CLUSTERS * DIM, bfp);
-        fclose(bfp);
-
-        printf("  BBox written for partition %d\n", t);
-
-        free(bmin);
-        free(bmax);
 
         free(cp);
         free(psorted);

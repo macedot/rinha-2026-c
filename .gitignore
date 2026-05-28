@@ -30,3 +30,15 @@
 # Allow CI
 !.github/
 !.github/**/*
+
+# Explicitly ignore build artifacts (binaries, objects, generated data during dev)
+# We commit the final good index in data/, but never the build binaries themselves.
+indexer/indexer
+rinha-server
+test_knn_accuracy
+*.o
+*.bin
+!data/*.bin   # exception: the committed good i16 index files are allowed
+data/part*_dataset.bin
+data/part*bbox_min.bin
+data/part*bbox_max.bin   # legacy float versions are intentionally deleted
