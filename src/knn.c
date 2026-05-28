@@ -222,6 +222,11 @@ static inline float scan_cluster_in_part(const part_t *part, int cluster_id,
 
     /* Scalar implementation (proven correct, 0/0 on official test) */
     for (int i = 0; i < n; i++) {
+        /* Prefetch next vector for better cache behavior */
+        if (i + 2 < n) {
+            __builtin_prefetch(records + (size_t)(i + 2) * 14, 0, 0);
+        }
+
         int64_t sum = 0;
         const int16_t *r = records + (size_t)i * 14;
         for (int d = 0; d < 14; d++) {
