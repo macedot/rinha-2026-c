@@ -268,12 +268,29 @@ static inline float scan_cluster_in_part(const part_t *part, int cluster_id,
             __builtin_prefetch(labs + (i + 1), 0, 0);
         }
 
-        int64_t sum = 0;
         const int16_t *r = records + (size_t)i * 14;
-        for (int d = 0; d < 14; d++) {
-            int64_t diff = (int64_t)q[d] - r[d];
-            sum += diff * diff;
-        }
+
+        /* Manually unrolled + strength-reduced for 14 dims (common hot path) */
+        int64_t d0  = (int64_t)q[0]  - r[0];
+        int64_t d1  = (int64_t)q[1]  - r[1];
+        int64_t d2  = (int64_t)q[2]  - r[2];
+        int64_t d3  = (int64_t)q[3]  - r[3];
+        int64_t d4  = (int64_t)q[4]  - r[4];
+        int64_t d5  = (int64_t)q[5]  - r[5];
+        int64_t d6  = (int64_t)q[6]  - r[6];
+        int64_t d7  = (int64_t)q[7]  - r[7];
+        int64_t d8  = (int64_t)q[8]  - r[8];
+        int64_t d9  = (int64_t)q[9]  - r[9];
+        int64_t d10 = (int64_t)q[10] - r[10];
+        int64_t d11 = (int64_t)q[11] - r[11];
+        int64_t d12 = (int64_t)q[12] - r[12];
+        int64_t d13 = (int64_t)q[13] - r[13];
+
+        int64_t sum = d0*d0 + d1*d1 + d2*d2 + d3*d3 +
+                      d4*d4 + d5*d5 + d6*d6 + d7*d7 +
+                      d8*d8 + d9*d9 + d10*d10 + d11*d11 +
+                      d12*d12 + d13*d13;
+
         if (sum < max_dist) {
             uint8_t lbl = labs[i];
             topk_insert(topk, K_NEIGHBORS, (float)sum, lbl);
