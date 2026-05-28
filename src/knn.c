@@ -17,7 +17,7 @@
 #define N_PARTITIONS 4
 #define N_CLUSTERS 2048
 /* Exact constants from the ASM reference (macros.inc) for fidelity */
-#define NPROBE_INITIAL     6    /* experimental: trying even lower (full validation required each time) */
+#define NPROBE_INITIAL     8    /* current best safe value (0/0 + good avg work) */
 #define NPROBE_REPAIR_MIN  1
 #define NPROBE_REPAIR_MAX  4
 #define SCALE 10000
