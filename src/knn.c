@@ -253,13 +253,17 @@ static inline float scan_cluster_in_part(const part_t *part, int cluster_id,
 
     if (vectors_scanned_out) *vectors_scanned_out += (uint32_t)n;
 
-    /* 2x unrolled scalar for ILP (two independent 14-dim L2sq in flight) + clean prefetch */
+    /* 2x unrolled scalar for ILP + deeper prefetch (10 ahead) + topk prefetch */
     int i;
     for (i = 0; i + 1 < n; i += 2) {
-        /* Prefetch 6 ahead to cover the pair + pipeline margin */
-        if (i + 6 < n) {
-            __builtin_prefetch(records + (size_t)(i + 6) * 14, 0, 0);
-            __builtin_prefetch(labs + (i + 6), 0, 0);
+        /* Deeper steady prefetch for better latency hiding on Haswell */
+        if (i + 10 < n) {
+            __builtin_prefetch(records + (size_t)(i + 10) * 14, 0, 0);
+            __builtin_prefetch(labs + (i + 10), 0, 0);
+        }
+        /* Prefetch the hot topk array (very small, worth it) */
+        if ((i & 3) == 0) {
+            __builtin_prefetch(topk, 1, 3);
         }
 
         /* --- vector i --- */
@@ -407,6 +411,23 @@ int rinha_search_with_stats(const float q_in[DIM], float *fraud_score_out, knn_s
     for (int pi = 0; pi < nprobe && pi < N_CLUSTERS; pi++) {
         int c = lb_dists[pi].idx;
         if (lb_dists[pi].dist >= max_dist) break;
+
+        /* Cross-cluster prefetch: hide latency for the next candidate cluster */
+        if (pi + 1 < nprobe) {
+            int nc = lb_dists[pi + 1].idx;
+            if (nc >= 0 && nc < N_CLUSTERS) {
+                uint32_t ns = part->offsets[nc];
+                uint32_t ne = part->offsets[nc + 1];
+                if (ns < ne) {
+                    __builtin_prefetch(part->data_i16 + (size_t)ns * 14, 0, 0);
+                    __builtin_prefetch(part->labels + ns, 0, 0);
+                    if (ns + 1 < ne) {
+                        __builtin_prefetch(part->data_i16 + (size_t)(ns + 1) * 14, 0, 0);
+                    }
+                }
+            }
+        }
+
         max_dist = scan_cluster_in_part(part, c, q, topk, max_dist, &local_stats.vectors_scanned);
         probed++;
         if (topk[0].dist < EARLY_EXIT_I16_DIST) {
@@ -421,6 +442,23 @@ int rinha_search_with_stats(const float q_in[DIM], float *fraud_score_out, knn_s
         for (int pi = nprobe; pi < N_CLUSTERS; pi++) {
             int c = lb_dists[pi].idx;
             if (lb_dists[pi].dist >= max_dist) break;
+
+            /* Cross-cluster prefetch in repair path too */
+            if (pi + 1 < N_CLUSTERS) {
+                int nc = lb_dists[pi + 1].idx;
+                if (nc >= 0 && nc < N_CLUSTERS) {
+                    uint32_t ns = part->offsets[nc];
+                    uint32_t ne = part->offsets[nc + 1];
+                    if (ns < ne) {
+                        __builtin_prefetch(part->data_i16 + (size_t)ns * 14, 0, 0);
+                        __builtin_prefetch(part->labels + ns, 0, 0);
+                        if (ns + 1 < ne) {
+                            __builtin_prefetch(part->data_i16 + (size_t)(ns + 1) * 14, 0, 0);
+                        }
+                    }
+                }
+            }
+
             max_dist = scan_cluster_in_part(part, c, q, topk, max_dist, &local_stats.vectors_scanned);
             probed++;
             if (topk[0].dist < EARLY_EXIT_I16_DIST) {
