@@ -255,13 +255,17 @@ static inline float scan_cluster_in_part(const part_t *part, int cluster_id,
 
     /* Scalar implementation (proven correct, 0/0 on official test) */
     for (int i = 0; i < n; i++) {
-        /* Aggressive prefetching: next 3 vectors + their labels */
-        if (i + 3 < n) {
-            __builtin_prefetch(records + (size_t)(i + 3) * 14, 0, 0);
-            __builtin_prefetch(labs + (i + 3), 0, 0);
+        /* Very aggressive prefetching for better memory latency hiding */
+        if (i + 4 < n) {
+            __builtin_prefetch(records + (size_t)(i + 4) * 14, 0, 0);
+            __builtin_prefetch(labs + (i + 4), 0, 0);
+        }
+        if (i + 2 < n) {
+            __builtin_prefetch(records + (size_t)(i + 2) * 14, 0, 0);
         }
         if (i + 1 < n) {
             __builtin_prefetch(records + (size_t)(i + 1) * 14, 0, 0);
+            __builtin_prefetch(labs + (i + 1), 0, 0);
         }
 
         int64_t sum = 0;
