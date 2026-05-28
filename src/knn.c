@@ -143,6 +143,38 @@ typedef struct {
 static inline void topk_insert(topk_t *tk, int k, float dist, uint8_t label) {
     if (dist >= tk[k - 1].dist) return;
 
+    // Unrolled for K=5 (common fast path)
+    if (k == 5) {
+        if (dist < tk[3].dist) {
+            tk[4] = tk[3];
+            if (dist < tk[2].dist) {
+                tk[3] = tk[2];
+                if (dist < tk[1].dist) {
+                    tk[2] = tk[1];
+                    if (dist < tk[0].dist) {
+                        tk[1] = tk[0];
+                        tk[0].dist = dist;
+                        tk[0].label = label;
+                        return;
+                    }
+                    tk[1].dist = dist;
+                    tk[1].label = label;
+                    return;
+                }
+                tk[2].dist = dist;
+                tk[2].label = label;
+                return;
+            }
+            tk[3].dist = dist;
+            tk[3].label = label;
+            return;
+        }
+        tk[4].dist = dist;
+        tk[4].label = label;
+        return;
+    }
+
+    // Generic fallback
     int pos = k - 1;
     while (pos > 0 && dist < tk[pos - 1].dist) {
         tk[pos] = tk[pos - 1];
