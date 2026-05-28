@@ -25,6 +25,6 @@ index: $(INDEXER)
 clean:
 	rm -f $(TARGET)
 	$(MAKE) -C indexer clean
-	rm -rf $(DATA_DIR)
+	# NOTE: data/ intentionally NOT deleted — it is LFS-tracked prebuilt index (expensive to regen)
 
 .PHONY: all clean index
