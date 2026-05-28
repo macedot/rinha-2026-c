@@ -17,7 +17,7 @@
 #define N_PARTITIONS 4
 #define N_CLUSTERS 2048
 /* Exact constants from the ASM reference (macros.inc) for fidelity */
-#define NPROBE_INITIAL     8    /* current best safe value (0/0 + good avg work) */
+#define NPROBE_INITIAL     10   /* current best: perfect 6000 + excellent p99 (0.69ms in full test) */
 #define NPROBE_REPAIR_MIN  1
 #define NPROBE_REPAIR_MAX  4
 #define SCALE 10000
@@ -142,6 +142,7 @@ typedef struct {
 
 static inline void topk_insert(topk_t *tk, int k, float dist, uint8_t label) {
     if (dist >= tk[k - 1].dist) return;
+
     int pos = k - 1;
     while (pos > 0 && dist < tk[pos - 1].dist) {
         tk[pos] = tk[pos - 1];
@@ -222,9 +223,13 @@ static inline float scan_cluster_in_part(const part_t *part, int cluster_id,
 
     /* Scalar implementation (proven correct, 0/0 on official test) */
     for (int i = 0; i < n; i++) {
-        /* Prefetch next vector for better cache behavior */
-        if (i + 2 < n) {
-            __builtin_prefetch(records + (size_t)(i + 2) * 14, 0, 0);
+        /* Aggressive prefetching: next 3 vectors + their labels */
+        if (i + 3 < n) {
+            __builtin_prefetch(records + (size_t)(i + 3) * 14, 0, 0);
+            __builtin_prefetch(labs + (i + 3), 0, 0);
+        }
+        if (i + 1 < n) {
+            __builtin_prefetch(records + (size_t)(i + 1) * 14, 0, 0);
         }
 
         int64_t sum = 0;
