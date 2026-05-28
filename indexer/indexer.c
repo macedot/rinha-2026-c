@@ -23,6 +23,19 @@
 /* ASM 4-partition flat IVF constants */
 #define N_PARTITIONS 4
 #define N_CLUSTERS 2048
+#define SCALE 10000
+
+/* Exact quantization to i16 (SCALE=10000) matching vectorize.asm + successful
+ * ports. The json "vector" floats are the canonical [0,1] features; we must
+ * store and search the i16 versions for numerical fidelity (this is why L2
+ * kmeans alone did not reach 0/0 — search was still in float space).
+ */
+static inline int16_t quantize_feature(float v) {
+    if (v <= -0.5f) return (int16_t)-SCALE;   /* sentinel for missing last_tx */
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return (int16_t)lroundf(v * (float)SCALE);
+}
 
 /* ASM canonical space: references.json "vector"[] are already the final normalized
  * linear features. Extract is now identity (no transforms). */
@@ -324,7 +337,73 @@ int main(int argc, char **argv) {
 
         printf("Partition %d: %d records, 2048 clusters written\n", t, pn);
 
-        /* Compute per-cluster axis-aligned bbox (float for now; next fidelity step will move to i16) */
+        /* Fidelity: emit i16 quantized data + separate labels + i16 bbox (computed on
+         * the quantized points). Float dataset + float bbox still written below so the
+         * old knn path continues to work during the transition. */
+        int16_t *qdata = (int16_t *)malloc((size_t)pn * DIM * sizeof(int16_t));
+        uint8_t *qlabels = (uint8_t *)malloc((size_t)pn);
+        for (int j = 0; j < pn; j++) {
+            const float *fv = psorted + (size_t)j * OUT_DIM;
+            for (int d = 0; d < DIM; d++) {
+                qdata[(size_t)j * DIM + d] = quantize_feature(fv[d]);
+            }
+            /* label was stashed in the float bits of dim15 during extract_features */
+            uint32_t bits;
+            memcpy(&bits, &fv[15], sizeof(uint32_t));
+            qlabels[j] = (uint8_t)(bits & 1u);
+        }
+
+        snprintf(path, sizeof(path), "%s/part%d_data_i16.bin", argv[2], t);
+        fp = fopen(path, "wb");
+        fwrite(qdata, sizeof(int16_t), (size_t)pn * DIM, fp);
+        fclose(fp);
+
+        snprintf(path, sizeof(path), "%s/part%d_labels.bin", argv[2], t);
+        fp = fopen(path, "wb");
+        fwrite(qlabels, 1, (size_t)pn, fp);
+        fclose(fp);
+
+        /* i16 bbox computed on the actual quantized points that will be searched */
+        int16_t *bmin16 = (int16_t *)malloc((size_t)N_CLUSTERS * DIM * sizeof(int16_t));
+        int16_t *bmax16 = (int16_t *)malloc((size_t)N_CLUSTERS * DIM * sizeof(int16_t));
+        for (int c = 0; c < N_CLUSTERS; c++) {
+            for (int d = 0; d < DIM; d++) {
+                bmin16[c*DIM + d] = INT16_MAX;
+                bmax16[c*DIM + d] = INT16_MIN;
+            }
+        }
+        for (int c = 0; c < N_CLUSTERS; c++) {
+            uint32_t start = poff[c];
+            uint32_t end = poff[c+1];
+            for (uint32_t i = start; i < end; i++) {
+                const int16_t *qv = qdata + (size_t)i * DIM;
+                for (int d = 0; d < DIM; d++) {
+                    if (qv[d] < bmin16[c*DIM + d]) bmin16[c*DIM + d] = qv[d];
+                    if (qv[d] > bmax16[c*DIM + d]) bmax16[c*DIM + d] = qv[d];
+                }
+            }
+        }
+
+        char bpath[4096];
+        FILE *bfp;
+        snprintf(bpath, sizeof(bpath), "%s/part%d_bbox_min_i16.bin", argv[2], t);
+        bfp = fopen(bpath, "wb");
+        fwrite(bmin16, sizeof(int16_t), (size_t)N_CLUSTERS * DIM, bfp);
+        fclose(bfp);
+
+        snprintf(bpath, sizeof(bpath), "%s/part%d_bbox_max_i16.bin", argv[2], t);
+        bfp = fopen(bpath, "wb");
+        fwrite(bmax16, sizeof(int16_t), (size_t)N_CLUSTERS * DIM, bfp);
+        fclose(bfp);
+
+        printf("  i16 data + labels + i16 bbox written for partition %d\n", t);
+
+        free(bmin16);
+        free(bmax16);
+        free(qlabels);
+        free(qdata);
+
+        /* Legacy float bbox (kept for now so old knn path still works) */
         float *bmin = (float *)malloc((size_t)N_CLUSTERS * DIM * sizeof(float));
         float *bmax = (float *)malloc((size_t)N_CLUSTERS * DIM * sizeof(float));
         for (int c = 0; c < N_CLUSTERS; c++) {
@@ -345,8 +424,6 @@ int main(int argc, char **argv) {
             }
         }
 
-        char bpath[4096];
-        FILE *bfp;
         snprintf(bpath, sizeof(bpath), "%s/part%d_bbox_min.bin", argv[2], t);
         bfp = fopen(bpath, "wb");
         fwrite(bmin, sizeof(float), (size_t)N_CLUSTERS * DIM, bfp);

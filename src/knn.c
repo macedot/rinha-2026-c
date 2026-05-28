@@ -26,6 +26,19 @@
 #define EARLY_EXIT_DIST 0.01f
 #define MAX_DIST_TRIGGER 2.0f
 
+/* Query quantizer — must be bit-identical to what indexer used on the references */
+static inline void quantize_query(const float in[14], int16_t out[14]) {
+    for (int d = 0; d < 14; d++) {
+        float v = in[d];
+        if (v <= -0.5f) out[d] = -SCALE;
+        else {
+            if (v < 0) v = 0;
+            if (v > 1) v = 1;
+            out[d] = (int16_t)lroundf(v * (float)SCALE);
+        }
+    }
+}
+
 /* All 1.0 — ASM linear normalized space needs no extra weighting */
 static const float FEATURE_WEIGHTS[DIM] = {
     1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
@@ -36,14 +49,20 @@ static const float FEATURE_WEIGHTS[DIM] = {
 /* --- ASM 4-partition flat index (one flat 2048-cluster IVF per partition) --- */
 
 typedef struct {
-    float *centroids;   /* 2048 * 16 floats */
-    uint32_t *offsets;  /* 2049 u32 */
-    float *dataset;     /* n_part * 16 floats, label in [15] */
-    float *bbox_min;    /* 2048 * 16 floats */
-    float *bbox_max;    /* 2048 * 16 floats */
+    float *centroids;     /* 2048 * 16 floats (legacy, not used for search) */
+    uint32_t *offsets;    /* 2049 u32 */
+    float *dataset;       /* legacy float path */
+    float *bbox_min;      /* legacy */
+    float *bbox_max;      /* legacy */
+    int16_t *data_i16;    /* n_records * 14 int16 (the real data for fidelity) */
+    uint8_t *labels;      /* n_records u8 */
+    int16_t *bbox_min_i16;
+    int16_t *bbox_max_i16;
     int n_records;
     void *cent_mmap, *off_mmap, *ds_mmap, *bmin_mmap, *bmax_mmap;
+    void *di16_mmap, *lab_mmap, *bmin16_mmap, *bmax16_mmap;
     size_t cent_size, off_size, ds_size, bmin_size, bmax_size;
+    size_t di16_size, lab_size, bmin16_size, bmax16_size;
 } part_t;
 
 static part_t g_parts[N_PARTITIONS];
@@ -96,6 +115,31 @@ int rinha_load_index(const char *path) {
         p->bmax_mmap = mmap_file(fp, &p->bmax_size);
         if (!p->bmax_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
         p->bbox_max = (float *)p->bmax_mmap;
+
+        /* New high-fidelity i16 paths (produced by indexer with quantize_feature) */
+        snprintf(fp, sizeof(fp), "%s/part%d_data_i16.bin", path, t);
+        p->di16_mmap = mmap_file(fp, &p->di16_size);
+        if (p->di16_mmap) {
+            p->data_i16 = (int16_t *)p->di16_mmap;
+        }
+
+        snprintf(fp, sizeof(fp), "%s/part%d_labels.bin", path, t);
+        p->lab_mmap = mmap_file(fp, &p->lab_size);
+        if (p->lab_mmap) {
+            p->labels = (uint8_t *)p->lab_mmap;
+        }
+
+        snprintf(fp, sizeof(fp), "%s/part%d_bbox_min_i16.bin", path, t);
+        p->bmin16_mmap = mmap_file(fp, &p->bmin16_size);
+        if (p->bmin16_mmap) {
+            p->bbox_min_i16 = (int16_t *)p->bmin16_mmap;
+        }
+
+        snprintf(fp, sizeof(fp), "%s/part%d_bbox_max_i16.bin", path, t);
+        p->bmax16_mmap = mmap_file(fp, &p->bmax16_size);
+        if (p->bmax16_mmap) {
+            p->bbox_max_i16 = (int16_t *)p->bmax16_mmap;
+        }
 
         total_records += p->n_records;
     }
@@ -218,6 +262,22 @@ static inline float bbox_lb_l2sq(const part_t *part, int c, const float q[DIM]) 
         float diff = 0.0f;
         if (q[d] > mx[d]) diff = q[d] - mx[d];
         else if (q[d] < mn[d]) diff = mn[d] - q[d];
+        lb += diff * diff;
+    }
+    return lb;
+}
+
+/* Exact i16 lower bound (squared) — this + i16 data is what finally matches ASM
+ * numeric behavior on the marginal cases that were producing the remaining ~975 errors.
+ */
+static inline int64_t bbox_lb_i16(const part_t *part, int c, const int16_t q[14]) {
+    int64_t lb = 0;
+    const int16_t *mn = part->bbox_min_i16 + (size_t)c * 14;
+    const int16_t *mx = part->bbox_max_i16 + (size_t)c * 14;
+    for (int d = 0; d < 14; d++) {
+        int64_t diff = 0;
+        if (q[d] > mx[d]) diff = (int64_t)q[d] - mx[d];
+        else if (q[d] < mn[d]) diff = (int64_t)mn[d] - q[d];
         lb += diff * diff;
     }
     return lb;
