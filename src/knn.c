@@ -15,16 +15,19 @@
 #define K_NEIGHBORS 5
 #define N_PARTITIONS 4
 #define N_CLUSTERS 2048
-#define NPROBE_INITIAL 128  /* extremely aggressive initial coverage with bbox pruning (still fast). Goal: drive errors to zero. */
-#define NPROBE_REPAIR_MIN 1
-#define NPROBE_REPAIR_MAX 4
+/* Exact constants from the ASM reference (macros.inc) for fidelity */
+#define NPROBE_INITIAL     12   /* small initial budget — repair does the heavy lifting on hard cases */
+#define NPROBE_REPAIR_MIN  1
+#define NPROBE_REPAIR_MAX  4
 #define SCALE 10000
 #define IDX_BITS 22
 #define CID_BITS 12
 
 #define APPROVAL_THRESHOLD 0.5f          /* count-based: <=2 frauds in top-5 → approved */
-#define EARLY_EXIT_DIST 0.01f
-#define MAX_DIST_TRIGGER 2.0f
+
+/* Early exit threshold in i16 squared-distance space.
+ * Very small positive distance after quantization (ASM is quite aggressive here). */
+#define EARLY_EXIT_I16_DIST 10000LL      /* corresponds to a very small float distance after *SCALE^2 scaling */
 
 /* Query quantizer — must be bit-identical to what indexer used on the references */
 static inline void quantize_query(const float in[14], int16_t out[14]) {
@@ -39,12 +42,7 @@ static inline void quantize_query(const float in[14], int16_t out[14]) {
     }
 }
 
-/* All 1.0 — ASM linear normalized space needs no extra weighting */
-static const float FEATURE_WEIGHTS[DIM] = {
-    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-    0.0f, 0.0f
-};
+/* FEATURE_WEIGHTS removed — we are now fully i16-native (matching ASM reference) */
 
 /* --- ASM 4-partition flat index (one flat 2048-cluster IVF per partition) --- */
 
@@ -90,62 +88,43 @@ int rinha_load_index(const char *path) {
     for (int t = 0; t < N_PARTITIONS; t++) {
         part_t *p = &g_parts[t];
 
+        /* Centroids + offsets are small and useful for debugging / future */
         snprintf(fp, sizeof(fp), "%s/part%d_centroids.bin", path, t);
         p->cent_mmap = mmap_file(fp, &p->cent_size);
-        if (!p->cent_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-        p->centroids = (float *)p->cent_mmap;
+        if (p->cent_mmap) p->centroids = (float *)p->cent_mmap;
 
         snprintf(fp, sizeof(fp), "%s/part%d_offsets.bin", path, t);
         p->off_mmap = mmap_file(fp, &p->off_size);
         if (!p->off_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
         p->offsets = (uint32_t *)p->off_mmap;
 
-        snprintf(fp, sizeof(fp), "%s/part%d_dataset.bin", path, t);
-        p->ds_mmap = mmap_file(fp, &p->ds_size);
-        if (!p->ds_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-        p->dataset = (float *)p->ds_mmap;
-        p->n_records = (p->ds_size > 0) ? (int)(p->ds_size / (DIM * sizeof(float))) : 0;
-
-        snprintf(fp, sizeof(fp), "%s/part%d_bbox_min.bin", path, t);
-        p->bmin_mmap = mmap_file(fp, &p->bmin_size);
-        if (!p->bmin_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-        p->bbox_min = (float *)p->bmin_mmap;
-
-        snprintf(fp, sizeof(fp), "%s/part%d_bbox_max.bin", path, t);
-        p->bmax_mmap = mmap_file(fp, &p->bmax_size);
-        if (!p->bmax_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
-        p->bbox_max = (float *)p->bmax_mmap;
-
-        /* New high-fidelity i16 paths (produced by indexer with quantize_feature) */
+        /* High-fidelity i16 path — this is now the only data the search uses */
         snprintf(fp, sizeof(fp), "%s/part%d_data_i16.bin", path, t);
         p->di16_mmap = mmap_file(fp, &p->di16_size);
-        if (p->di16_mmap) {
-            p->data_i16 = (int16_t *)p->di16_mmap;
-        }
+        if (!p->di16_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+        p->data_i16 = (int16_t *)p->di16_mmap;
 
         snprintf(fp, sizeof(fp), "%s/part%d_labels.bin", path, t);
         p->lab_mmap = mmap_file(fp, &p->lab_size);
-        if (p->lab_mmap) {
-            p->labels = (uint8_t *)p->lab_mmap;
-        }
+        if (!p->lab_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+        p->labels = (uint8_t *)p->lab_mmap;
 
         snprintf(fp, sizeof(fp), "%s/part%d_bbox_min_i16.bin", path, t);
         p->bmin16_mmap = mmap_file(fp, &p->bmin16_size);
-        if (p->bmin16_mmap) {
-            p->bbox_min_i16 = (int16_t *)p->bmin16_mmap;
-        }
+        if (!p->bmin16_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+        p->bbox_min_i16 = (int16_t *)p->bmin16_mmap;
 
         snprintf(fp, sizeof(fp), "%s/part%d_bbox_max_i16.bin", path, t);
         p->bmax16_mmap = mmap_file(fp, &p->bmax16_size);
-        if (p->bmax16_mmap) {
-            p->bbox_max_i16 = (int16_t *)p->bmax16_mmap;
-        }
+        if (!p->bmax16_mmap) { fprintf(stderr, "failed to mmap %s\n", fp); return -1; }
+        p->bbox_max_i16 = (int16_t *)p->bmax16_mmap;
 
+        p->n_records = (p->di16_size > 0) ? (int)(p->di16_size / (14 * sizeof(int16_t))) : 0;
         total_records += p->n_records;
     }
 
     g_loaded = 1;
-    fprintf(stderr, "ASM 4-partition index loaded: %d total records (2048 clusters per part)\n", total_records);
+    fprintf(stderr, "ASM 4-partition index loaded (i16 path): %d total records (2048 clusters per part)\n", total_records);
     return 0;
 }
 
@@ -171,68 +150,7 @@ static inline void topk_insert(topk_t *tk, int k, float dist, uint8_t label) {
     tk[pos].label = label;
 }
 
-static inline uint8_t unpack_label(float packed) {
-    uint32_t bits;
-    memcpy(&bits, &packed, sizeof(uint32_t));
-    return (uint8_t)(bits & 1u);
-}
-
-/* --- Distance kernels --- */
-
-static inline float l2sq_scalar(const float a[DIM], const float b[DIM]) {
-    float sum = 0.0f;
-    for (int i = 0; i < 14; i++) {
-        float d = a[i] - b[i];
-        sum += d * d;
-    }
-    return sum;
-}
-
-#ifdef __AVX2__
-#include <immintrin.h>
-
-static inline float hsum_ps(__m128 v) {
-    v = _mm_hadd_ps(v, v);
-    v = _mm_hadd_ps(v, v);
-    return _mm_cvtss_f32(v);
-}
-
-static inline float l2sq_avx2(const float a[DIM], const float b[DIM]) {
-    __m256 q0 = _mm256_loadu_ps(a);
-    __m256 q1 = _mm256_loadu_ps(a + 8);
-    __m256 c0 = _mm256_loadu_ps(b);
-    __m256 c1 = _mm256_loadu_ps(b + 8);
-    __m256 d0 = _mm256_sub_ps(q0, c0);
-    __m256 d1 = _mm256_sub_ps(q1, c1);
-    __m256 s0 = _mm256_mul_ps(d0, d0);
-    __m256 s1 = _mm256_mul_ps(d1, d1);
-    __m256 s = _mm256_add_ps(s0, s1);
-    __m128 lo = _mm256_castps256_ps128(s);
-    __m128 hi = _mm256_extractf128_ps(s, 1);
-    return hsum_ps(_mm_add_ps(lo, hi));
-}
-
-static inline void l2sq_avx2_x4(const float q[DIM],
-                                const float *r0, const float *r1,
-                                const float *r2, const float *r3,
-                                float out[4]) {
-    __m256 q0 = _mm256_loadu_ps(q);
-    __m256 q1 = _mm256_loadu_ps(q + 8);
-    const float *rr[4] = {r0, r1, r2, r3};
-    for (int i = 0; i < 4; i++) {
-        __m256 c0 = _mm256_loadu_ps(rr[i]);
-        __m256 c1 = _mm256_loadu_ps(rr[i] + 8);
-        __m256 d0 = _mm256_sub_ps(q0, c0);
-        __m256 d1 = _mm256_sub_ps(q1, c1);
-        __m256 s0 = _mm256_mul_ps(d0, d0);
-        __m256 s1 = _mm256_mul_ps(d1, d1);
-        __m256 s = _mm256_add_ps(s0, s1);
-        __m128 lo = _mm256_castps256_ps128(s);
-        __m128 hi = _mm256_extractf128_ps(s, 1);
-        out[i] = hsum_ps(_mm_add_ps(lo, hi));
-    }
-}
-#endif
+/* --- Distance kernels (i16 only) --- */
 
 /* --- Top-N selection helpers --- */
 
@@ -283,61 +201,42 @@ static inline int64_t bbox_lb_i16(const part_t *part, int c, const int16_t q[14]
     return lb;
 }
 
+/* i16-native cluster scan (the real hot path for fidelity).
+ * Uses the clean int16 data + separate labels we now emit.
+ */
 static inline float scan_cluster_in_part(const part_t *part, int cluster_id,
-                                         const float q[DIM], topk_t *topk, float max_dist) {
+                                         const int16_t q[14], topk_t *topk, float max_dist) {
     if (cluster_id < 0 || cluster_id >= N_CLUSTERS) return max_dist;
     uint32_t start = part->offsets[cluster_id];
     uint32_t end = part->offsets[cluster_id + 1];
     if (end <= start) return max_dist;
 
-    const float *records = part->dataset + (size_t)start * DIM;
+    const int16_t *records = part->data_i16 + (size_t)start * 14;
+    const uint8_t *labs    = part->labels + start;
     int n = (int)(end - start);
 
-#ifdef __AVX2__
-    int i = 0;
-    while (i + 3 < n) {
-        float dists[4];
-        l2sq_avx2_x4(q,
-            records + (size_t)i * DIM,
-            records + (size_t)(i + 1) * DIM,
-            records + (size_t)(i + 2) * DIM,
-            records + (size_t)(i + 3) * DIM,
-            dists);
-        for (int j = 0; j < 4; j++) {
-            if (dists[j] < max_dist) {
-                uint8_t lbl = unpack_label(records[(size_t)(i + j) * DIM + 15]);
-                topk_insert(topk, K_NEIGHBORS, dists[j], lbl);
-                max_dist = topk[K_NEIGHBORS - 1].dist;
-            }
-        }
-        i += 4;
-    }
-    while (i < n) {
-        float d = l2sq_avx2(q, records + (size_t)i * DIM);
-        if (d < max_dist) {
-            uint8_t lbl = unpack_label(records[(size_t)i * DIM + 15]);
-            topk_insert(topk, K_NEIGHBORS, d, lbl);
-            max_dist = topk[K_NEIGHBORS - 1].dist;
-        }
-        i++;
-    }
-#else
+    /* Simple scalar path first (correctness > micro-optimizations while we chase 0/0) */
     for (int i = 0; i < n; i++) {
-        float d = l2sq_scalar(q, records + (size_t)i * DIM);
-        if (d < max_dist) {
-            uint8_t lbl = unpack_label(records[(size_t)i * DIM + 15]);
-            topk_insert(topk, K_NEIGHBORS, d, lbl);
+        int64_t sum = 0;
+        const int16_t *r = records + (size_t)i * 14;
+        for (int d = 0; d < 14; d++) {
+            int64_t diff = (int64_t)q[d] - r[d];
+            sum += diff * diff;
+        }
+        if (sum < max_dist) {
+            uint8_t lbl = labs[i];
+            topk_insert(topk, K_NEIGHBORS, (float)sum, lbl);
             max_dist = topk[K_NEIGHBORS - 1].dist;
         }
     }
-#endif
     return max_dist;
 }
 
 /* --- Compute fraud score from top-k --- */
 
 static inline int calculate_score(topk_t *topk, float *score_out) {
-    if (topk[0].dist < EARLY_EXIT_DIST) {
+    /* Early exit using i16-scale distance (top-1 is extremely close) */
+    if (topk[0].dist < EARLY_EXIT_I16_DIST) {
         *score_out = topk[0].label ? 1.0f : 0.0f;
         return topk[0].label == 0;
     }
@@ -349,17 +248,17 @@ static inline int calculate_score(topk_t *topk, float *score_out) {
     return score < APPROVAL_THRESHOLD;
 }
 
-/* --- Main search --- */
+/* --- Main search (now i16-native for fidelity with ASM reference) --- */
 
 int rinha_search(const float q_in[DIM], float *fraud_score_out) {
     if (!g_loaded || !fraud_score_out) return 0;
 
-    float q[DIM];
-    for (int i = 0; i < 14; i++) q[i] = q_in[i] * FEATURE_WEIGHTS[i];
-    q[14] = 0.0f; q[15] = 0.0f;
+    /* Quantize the incoming float query to i16 exactly as the indexer did for references */
+    int16_t q[14];
+    quantize_query(q_in, q);
 
-    /* ASM tag routing */
-    int tag = ((q[11] > 0.5f) ? 2 : 0) | ((q[5] >= 0.0f) ? 1 : 0);
+    /* ASM tag routing on the quantized values (matches vectorize.asm + search.asm) */
+    int tag = ((q[11] > 0) ? 2 : 0) | ((q[5] >= 0) ? 1 : 0);
     part_t *part = &g_parts[tag];
 
     if (part->n_records == 0) {
@@ -367,10 +266,10 @@ int rinha_search(const float q_in[DIM], float *fraud_score_out) {
         return 1;
     }
 
-    /* ASM-style bbox lower-bound pruning + repair (using squared L2 like the reference) */
+    /* Order all 2048 clusters by i16 lower-bound distance (exact match to ASM intent) */
     dist_idx_t lb_dists[N_CLUSTERS];
     for (int i = 0; i < N_CLUSTERS; i++) {
-        lb_dists[i].dist = bbox_lb_l2sq(part, i, q);
+        lb_dists[i].dist = (float)bbox_lb_i16(part, i, q);   /* float for qsort convenience */
         lb_dists[i].idx = i;
     }
     qsort(lb_dists, N_CLUSTERS, sizeof(dist_idx_t), cmp_dist_asc);
@@ -382,34 +281,22 @@ int rinha_search(const float q_in[DIM], float *fraud_score_out) {
     }
     float max_dist = FLT_MAX;
 
+    /* Small initial probe budget + repair on ambiguous top-5 (exact ASM behavior) */
     int nprobe = NPROBE_INITIAL;
     for (int pi = 0; pi < nprobe && pi < N_CLUSTERS; pi++) {
         int c = lb_dists[pi].idx;
-        /* Early skip if lb already worse than current worst in topk */
         if (lb_dists[pi].dist >= max_dist) break;
         max_dist = scan_cluster_in_part(part, c, q, topk, max_dist);
-        if (topk[0].dist < EARLY_EXIT_DIST) break;
+        if (topk[0].dist < EARLY_EXIT_I16_DIST) break;
     }
 
     int fcnt = fraud_count_in_topk(topk);
-    /* Extremely aggressive repair to drive errors to zero:
-     * After initial probes, if top-K is not unanimous (not 0 or 5 frauds),
-     * force a very large additional probe budget. */
-    if (fcnt > 0 && fcnt < K_NEIGHBORS) {
-        int target = 1536;  /* very large fraction on any uncertainty — final push for 0/0 */
-        for (int pi = nprobe; pi < target && pi < N_CLUSTERS; pi++) {
-            int c = lb_dists[pi].idx;
-            if (lb_dists[pi].dist >= max_dist) break;
-            max_dist = scan_cluster_in_part(part, c, q, topk, max_dist);
-            if (topk[0].dist < EARLY_EXIT_DIST) break;
-        }
-    } else if (fcnt >= NPROBE_REPAIR_MIN && fcnt <= NPROBE_REPAIR_MAX) {
-        /* fallback original repair */
+    if (fcnt >= NPROBE_REPAIR_MIN && fcnt <= NPROBE_REPAIR_MAX) {
         for (int pi = nprobe; pi < N_CLUSTERS; pi++) {
             int c = lb_dists[pi].idx;
             if (lb_dists[pi].dist >= max_dist) break;
             max_dist = scan_cluster_in_part(part, c, q, topk, max_dist);
-            if (topk[0].dist < EARLY_EXIT_DIST) break;
+            if (topk[0].dist < EARLY_EXIT_I16_DIST) break;
         }
     }
 
