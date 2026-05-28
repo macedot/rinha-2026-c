@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <float.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -28,49 +29,6 @@
 /* Early exit threshold in i16 squared-distance space.
  * Very small positive distance after quantization (ASM is quite aggressive here). */
 #define EARLY_EXIT_I16_DIST 10000LL      /* corresponds to a very small float distance after *SCALE^2 scaling */
-
-/* ======================================================================
- * High-performance AVX2 distance kernel (Haswell+ target)
- * Computes exact same 14-dim int16 squared L2 as the scalar version.
- * Must remain bit-identical for 0/0 correctness.
- * ====================================================================== */
-
-#ifdef __AVX2__
-#include <immintrin.h>
-
-/* Computes exact same sum((q[0..13] - r[0..13])^2) as the scalar version.
- * Uses AVX2 + madd_epi16 for speed on Haswell+.
- * Must remain numerically identical (critical for 0/0 correctness).
- */
-static inline int64_t i16_sqdist_14_avx2(const int16_t q[14], const int16_t *r) {
-    __m256i qv = _mm256_loadu_si256((const __m256i *)q);
-    __m256i rv = _mm256_loadu_si256((const __m256i *)r);
-
-    __m256i diff = _mm256_sub_epi16(qv, rv);
-
-    // We have 14 values. Process as two groups for clean madd:
-    // Group 0: elements 0-7  (full 128-bit)
-    // Group 1: elements 8-13 (we mask the last two)
-
-    __m128i d0 = _mm256_castsi256_si128(diff);
-    __m128i sq0 = _mm_madd_epi16(d0, d0);                    // 4 × int32
-
-    __m128i d1 = _mm256_extracti128_si256(diff, 1);
-    __m128i mask = _mm_setr_epi16(-1, -1, -1, -1, -1, -1, 0, 0);
-    d1 = _mm_and_si128(d1, mask);
-    __m128i sq1 = _mm_madd_epi16(d1, d1);                    // 4 × int32 (last two zero)
-
-    __m128i sum32 = _mm_add_epi32(sq0, sq1);
-
-    // Widen to int64 and horizontal sum (safe, no overflow for our data)
-    __m128i lo = _mm_cvtepi32_epi64(sum32);
-    __m128i hi = _mm_cvtepi32_epi64(_mm_shuffle_epi32(sum32, _MM_SHUFFLE(3, 2, 3, 2)));
-    __m128i total = _mm_add_epi64(lo, hi);
-
-    return (int64_t)_mm_cvtsi128_si64(total) +
-           (int64_t)_mm_extract_epi64(total, 1);
-}
-#endif // __AVX2__
 
 /* Query quantizer — must be bit-identical to what indexer used on the references */
 static inline void quantize_query(const float in[14], int16_t out[14]) {
@@ -168,16 +126,6 @@ int rinha_load_index(const char *path) {
 
     g_loaded = 1;
     fprintf(stderr, "ASM 4-partition index loaded (i16 path): %d total records (2048 clusters per part)\n", total_records);
-
-#ifdef __AVX2__
-    extern bool knn_validate_distance_kernel(int trials);
-    if (!knn_validate_distance_kernel(50000)) {
-        fprintf(stderr, "FATAL: AVX2 distance kernel failed self-validation!\n");
-        return -1;
-    }
-    fprintf(stderr, "AVX2 distance kernel self-validated (50k trials)\n");
-#endif
-
     return 0;
 }
 
@@ -272,18 +220,7 @@ static inline float scan_cluster_in_part(const part_t *part, int cluster_id,
 
     if (vectors_scanned_out) *vectors_scanned_out += (uint32_t)n;
 
-#ifdef __AVX2__
-    /* Fast AVX2 path (Haswell+). Must produce identical numeric results. */
-    for (int i = 0; i < n; i++) {
-        int64_t sum = i16_sqdist_14_avx2(q, records + (size_t)i * 14);
-        if (sum < max_dist) {
-            uint8_t lbl = labs[i];
-            topk_insert(topk, K_NEIGHBORS, (float)sum, lbl);
-            max_dist = topk[K_NEIGHBORS - 1].dist;
-        }
-    }
-#else
-    /* Scalar fallback */
+    /* Scalar implementation (proven correct, 0/0 on official test) */
     for (int i = 0; i < n; i++) {
         int64_t sum = 0;
         const int16_t *r = records + (size_t)i * 14;
@@ -297,7 +234,6 @@ static inline float scan_cluster_in_part(const part_t *part, int cluster_id,
             max_dist = topk[K_NEIGHBORS - 1].dist;
         }
     }
-#endif
     return max_dist;
 }
 
@@ -345,7 +281,7 @@ int rinha_search_with_stats(const float q_in[DIM], float *fraud_score_out, knn_s
     /* Order all 2048 clusters by i16 lower-bound distance (exact match to ASM intent) */
     dist_idx_t lb_dists[N_CLUSTERS];
     for (int i = 0; i < N_CLUSTERS; i++) {
-        lb_dists[i].dist = (float)bbox_lb_i16(part, i, q);   /* float for qsort convenience */
+        lb_dists[i].dist = (float)bbox_lb_i16(part, i, q);
         lb_dists[i].idx = i;
     }
     qsort(lb_dists, N_CLUSTERS, sizeof(dist_idx_t), cmp_dist_asc);
@@ -406,43 +342,5 @@ void rinha_get_inst(uint64_t out[7]) {
 void rinha_reset_inst(void) {
 }
 
-/* ======================================================================
- * Correctness validation for the AVX2 distance kernel.
- * Call this at startup in debug builds or via a test.
- * Returns true if AVX2 and scalar produce identical results on random data.
- * ====================================================================== */
 
-#ifdef __AVX2__
-#include <time.h>
-
-bool knn_validate_distance_kernel(int trials) {
-    int16_t q[14];
-    int16_t r[14];
-
-    srand(0xC0FFEE);
-
-    for (int t = 0; t < trials; t++) {
-        // Generate somewhat realistic data in [-10000, 10000]
-        for (int d = 0; d < 14; d++) {
-            q[d] = (int16_t)(rand() % 20001 - 10000);
-            r[d] = (int16_t)(rand() % 20001 - 10000);
-        }
-
-        // Scalar reference
-        int64_t ref = 0;
-        for (int d = 0; d < 14; d++) {
-            int64_t diff = (int64_t)q[d] - r[d];
-            ref += diff * diff;
-        }
-
-        int64_t avx = i16_sqdist_14_avx2(q, r);
-
-        if (ref != avx) {
-            fprintf(stderr, "DISTANCE MISMATCH at trial %d: ref=%lld avx=%lld\n", t, (long long)ref, (long long)avx);
-            return false;
-        }
-    }
-    return true;
-}
-#endif
 

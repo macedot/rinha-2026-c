@@ -4,7 +4,7 @@
 #include <string.h>
 
 #define PERF_RING_SIZE 4096
-#define PERF_REPORT_INTERVAL 1000
+#define PERF_REPORT_INTERVAL 200   /* report more frequently during tuning */
 
 static perf_sample_t g_perf_ring[PERF_RING_SIZE] __attribute__((aligned(64)));
 static volatile uint32_t g_perf_idx = 0;
@@ -67,6 +67,9 @@ void perf_report(void) {
     uint64_t *send_vals = (uint64_t *)malloc((size_t)n * sizeof(uint64_t));
     uint64_t *total_vals = (uint64_t *)malloc((size_t)n * sizeof(uint64_t));
 
+    uint64_t clusters_sum = 0, vectors_sum = 0;
+    uint64_t repair_count = 0, early_exit_count = 0;
+
     if (!recv_vals || !json_vals || !knn_vals || !send_vals || !total_vals) {
         free(recv_vals); free(json_vals); free(knn_vals); free(send_vals); free(total_vals);
         return;
@@ -79,6 +82,11 @@ void perf_report(void) {
         knn_vals[i] = g_perf_ring[ri].knn_ns;
         send_vals[i] = g_perf_ring[ri].send_ns;
         total_vals[i] = g_perf_ring[ri].total_ns;
+
+        clusters_sum += g_perf_ring[ri].clusters_probed;
+        vectors_sum  += g_perf_ring[ri].vectors_scanned;
+        repair_count += g_perf_ring[ri].repair_triggered;
+        early_exit_count += g_perf_ring[ri].early_exit_taken;
     }
 
     fprintf(stderr, "[PERF] N=%u |", count);
@@ -87,7 +95,18 @@ void perf_report(void) {
     report_field("knn", knn_vals, n);
     report_field("send", send_vals, n);
     report_field("total", total_vals, n);
-    fprintf(stderr, "\n");
+
+    double avg_clusters = (double)clusters_sum / (double)n;
+    double avg_vectors  = (double)vectors_sum  / (double)n;
+    double repair_pct   = (double)repair_count   * 100.0 / (double)n;
+    double early_pct    = (double)early_exit_count * 100.0 / (double)n;
+
+    fprintf(stderr, " | knn_detail: avg_clusters=%.1f avg_vecs=%.1f repair=%.1f%% early_exit=%.1f%%\n",
+            avg_clusters, avg_vectors, repair_pct, early_pct);
 
     free(recv_vals); free(json_vals); free(knn_vals); free(send_vals); free(total_vals);
+}
+
+void perf_force_report(void) {
+    perf_report();
 }

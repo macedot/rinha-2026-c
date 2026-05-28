@@ -129,8 +129,10 @@ static int handle_request(conn_t *c, perf_sample_t *ps) {
     }
 
     if (memcmp(req_buf, "GET /inst", 9) == 0) {
-        const char *msg = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ninst disabled\n";
-        send_all(fd, msg, 48);
+        extern void perf_report(void);  /* from perf.c */
+        perf_report();
+        const char *msg = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nperf report triggered (see server stderr)\n";
+        send_all(fd, msg, strlen(msg));
         return -1;
     }
 
@@ -159,9 +161,16 @@ static int handle_request(conn_t *c, perf_sample_t *ps) {
 
         uint64_t t_knn_start = perf_now();
         float fraud_score = 0.0f;
-        int approved = rinha_search(q, &fraud_score);
+        knn_stats_t kstats = {0};
+        int approved = rinha_search_with_stats(q, &fraud_score, &kstats);
         uint64_t t_knn_end = perf_now();
-        if (ps) ps->knn_ns += t_knn_end - t_knn_start;
+        if (ps) {
+            ps->knn_ns += t_knn_end - t_knn_start;
+            ps->clusters_probed = kstats.clusters_probed;
+            ps->vectors_scanned = kstats.vectors_scanned;
+            ps->repair_triggered = kstats.repair_triggered;
+            ps->early_exit_taken = kstats.early_exit_taken;
+        }
 
         uint64_t t_send_start = perf_now();
         char resp_buf[256];
@@ -190,7 +199,7 @@ static int process_conn(conn_t *c) {
     char *req_buf = c->req_buf;
     size_t *req_len = &c->req_len;
 
-    perf_sample_t ps = {0, 0, 0, 0, 0};
+    perf_sample_t ps = {0};  /* zero-initializes all fields including new knn stats */
     int did_recv = 0;
 
     while (1) {
